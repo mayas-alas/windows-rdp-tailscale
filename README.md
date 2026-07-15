@@ -4,7 +4,7 @@ El workflow crea un Windows Server 2025 efímero, descarga tu repositorio, insta
 ## 1. Configura el tag en Tailscale
 
 En Tailscale Admin Console → Access controls, integra estas entradas en tu política actual. No reemplaces todo el archivo si ya tienes reglas:
-´´´
+---
 {
   "tagOwners": {
     "tag:github-rdp": []
@@ -18,7 +18,7 @@ En Tailscale Admin Console → Access controls, integra estas entradas en tu pol
     }
   ]
 }
-´´´
+---
 Reemplaza el correo con el que utilizas para iniciar sesión en Tailscale. La política concede RDP solamente a tus dispositivos y solamente hacia la VM etiquetada como tag:github-rdp. Tailscale recomienda usar grants para configuraciones nuevas y admite restricciones por protocolo y puerto.
 
 ## 2. Crea las credenciales OAuth de Tailscale
