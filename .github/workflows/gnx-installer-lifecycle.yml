@@ -13,7 +13,11 @@ on:
         type: string
 
 permissions:
-  contents: read
+  # Draft releases are visible only to collaborators; the ephemeral job token
+  # therefore needs collaborator-level contents access to download the frozen
+  # asset. The workflow performs no checkout, push, release mutation, or tag
+  # mutation, and accepts only a constrained tag plus an exact SHA256.
+  contents: write
 
 concurrency:
   group: gnx-windows-installer-lifecycle
