@@ -3,8 +3,8 @@ name: GNX Windows installer lifecycle
 on:
   workflow_dispatch:
     inputs:
-      artifact_url:
-        description: Tailnet-only HTTP(S) URL for the frozen GNX setup EXE
+      release_tag:
+        description: Temporary draft release tag containing the frozen setup EXE
         required: true
         type: string
       expected_sha256:
@@ -25,42 +25,22 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     env:
-      ARTIFACT_URL: ${{ inputs.artifact_url }}
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
       EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
 
     steps:
-      - name: Validate inputs and required secrets
+      - name: Validate inputs
         shell: pwsh
-        env:
-          TS_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          TS_CLIENT_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $uri = [Uri]$env:ARTIFACT_URL
-          if ($uri.Scheme -notin @("http", "https") -or -not $uri.Host.EndsWith(".ts.net")) {
-              throw "artifact_url must use a tailnet-only .ts.net host."
+          if ($env:RELEASE_TAG -notmatch "^gnx-smoke-[0-9]+$") {
+              throw "release_tag must match gnx-smoke-<numeric-id>."
           }
           if ($env:EXPECTED_SHA256 -notmatch "^[A-Fa-f0-9]{64}$") {
               throw "expected_sha256 must contain exactly 64 hexadecimal characters."
           }
-          if ([string]::IsNullOrWhiteSpace($env:TS_CLIENT_ID) -or
-              [string]::IsNullOrWhiteSpace($env:TS_CLIENT_SECRET)) {
-              throw "Tailscale OAuth secrets are not configured."
-          }
-
-      - name: Connect runner to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:github-rdp
-          hostname: github-gnx-smoke-${{ github.run_id }}
-          version: latest
-          timeout: 3m
-          retry: "5"
-          use-cache: "true"
-          log-mode: normal
 
       - name: Exercise frozen installer lifecycle
         id: lifecycle
@@ -150,7 +130,17 @@ jobs:
           }
 
           try {
-              Invoke-WebRequest -Uri $env:ARTIFACT_URL -OutFile $setupPath
+              $assetName = "Quetzalcoatl-0.3.0-preview-setup-x64.exe"
+              gh release download $env:RELEASE_TAG `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --pattern $assetName `
+                  --dir $env:RUNNER_TEMP `
+                  --clobber
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Could not download the frozen setup from the temporary draft release."
+              }
+              $downloadedPath = Join-Path $env:RUNNER_TEMP $assetName
+              Move-Item -LiteralPath $downloadedPath -Destination $setupPath -Force
               $actualHash = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
               $summary.actualSha256 = $actualHash
               if ($actualHash -ne $summary.expectedSha256) {
