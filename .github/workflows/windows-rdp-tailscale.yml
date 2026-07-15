@@ -1,0 +1,284 @@
+name: Windows RDP via Tailscale
+
+run-name: >-
+  Windows RDP · ${{ inputs.duration_minutes }} min · ${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: How long the remote development session stays available
+        required: true
+        default: "180"
+        type: choice
+        options:
+          - "60"
+          - "120"
+          - "180"
+          - "240"
+          - "300"
+          - "330"
+
+# Keep a single remote Windows workstation active per repository.
+concurrency:
+  group: windows-rdp-${{ github.repository }}
+  cancel-in-progress: true
+
+# Read-only repository access is enough for the development workstation.
+permissions:
+  contents: read
+
+env:
+  # This is not secret. Change it here if you prefer another local Windows user.
+  RDP_USERNAME: ghrdp
+
+jobs:
+  windows-rdp:
+    name: Windows Server 2025 remote development
+    runs-on: windows-2025
+
+    # GitHub-hosted jobs have a six-hour hard limit. Keep setup/cleanup headroom.
+    timeout-minutes: 350
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Validate required secrets
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:TS_OAUTH_CLIENT_ID)) { $missing += "TS_OAUTH_CLIENT_ID" }
+          if ([string]::IsNullOrWhiteSpace($env:TS_OAUTH_SECRET))    { $missing += "TS_OAUTH_SECRET" }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD))      { $missing += "RDP_PASSWORD" }
+
+          if ($missing.Count -gt 0) {
+            throw "Missing GitHub Actions secrets: $($missing -join ', ')"
+          }
+
+          # Avoid a password that Windows rejects under its default complexity policy.
+          $passwordChecks = @(
+            @{ Name = "14 characters"; Pattern = '.{14,}' },
+            @{ Name = "an uppercase letter"; Pattern = '[A-Z]' },
+            @{ Name = "a lowercase letter"; Pattern = '[a-z]' },
+            @{ Name = "a number"; Pattern = '[0-9]' },
+            @{ Name = "a special character"; Pattern = '[^A-Za-z0-9]' }
+          )
+
+          $failedChecks = @(
+            $passwordChecks |
+              Where-Object { $env:RDP_PASSWORD -notmatch $_.Pattern } |
+              ForEach-Object { $_.Name }
+          )
+
+          if ($failedChecks.Count -gt 0) {
+            throw "RDP_PASSWORD must contain: $($failedChecks -join ', '). A random 20+ character password is recommended."
+          }
+
+          if ($env:RDP_PASSWORD -match [regex]::Escape($env:RDP_USERNAME)) {
+            throw "RDP_PASSWORD must not contain RDP_USERNAME."
+          }
+
+          if ($env:RDP_USERNAME -notmatch '^[A-Za-z][A-Za-z0-9._-]{2,19}$') {
+            throw "RDP_USERNAME must be 3-20 characters and use only letters, numbers, dot, underscore or dash."
+          }
+
+          # Defense in depth if the value is ever emitted by another command.
+          Write-Output "::add-mask::$env:RDP_PASSWORD"
+
+      - name: Checkout repository for development and testing
+        # actions/checkout v7.0.0, pinned to its immutable commit SHA.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Connect the runner to Tailscale
+        # tailscale/github-action v4.1.3, pinned to its immutable commit SHA.
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:github-rdp
+          hostname: gh-rdp-${{ github.run_id }}
+          version: latest
+          timeout: 3m
+          retry: "5"
+          use-cache: "true"
+
+      - name: Create the RDP user and harden Remote Desktop
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          Write-Output "::add-mask::$env:RDP_PASSWORD"
+
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $existingUser = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingUser) {
+            New-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword `
+              -FullName "GitHub Actions Remote Administrator" `
+              -Description "Temporary RDP account for this ephemeral GitHub Actions runner" `
+              -AccountNeverExpires `
+              -PasswordNeverExpires | Out-Null
+          }
+          else {
+            Set-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword `
+              -AccountNeverExpires $true `
+              -PasswordNeverExpires $true
+          }
+
+          Enable-LocalUser -Name $env:RDP_USERNAME
+
+          # Resolve built-in group names by SID so this works independently of display language.
+          $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+          $administratorsGroup = $administratorsSid.Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+
+          $remoteDesktopSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-555")
+          $remoteDesktopGroup = $remoteDesktopSid.Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+
+          Add-LocalGroupMember -Group $administratorsGroup -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group $remoteDesktopGroup -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          $terminalServerPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          $rdpTcpPath = "$terminalServerPath\WinStations\RDP-Tcp"
+
+          # Enable RDP, require Network Level Authentication and high TLS encryption.
+          Set-ItemProperty -Path $terminalServerPath -Name "fDenyTSConnections" -Type DWord -Value 0
+          Set-ItemProperty -Path $rdpTcpPath -Name "UserAuthentication" -Type DWord -Value 1
+          Set-ItemProperty -Path $rdpTcpPath -Name "SecurityLayer" -Type DWord -Value 2
+          Set-ItemProperty -Path $rdpTcpPath -Name "MinEncryptionLevel" -Type DWord -Value 3
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          # Do not expose TCP/UDP 3389 broadly. Permit only Tailscale source ranges.
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule | Out-Null
+
+          Get-NetFirewallRule -DisplayName "GitHub RDP via Tailscale*" -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule | Out-Null
+
+          foreach ($protocol in @("TCP", "UDP")) {
+            New-NetFirewallRule `
+              -DisplayName "GitHub RDP via Tailscale IPv4 ($protocol)" `
+              -Direction Inbound `
+              -Action Allow `
+              -Enabled True `
+              -Profile Any `
+              -Protocol $protocol `
+              -LocalPort 3389 `
+              -RemoteAddress "100.64.0.0/10" | Out-Null
+
+            New-NetFirewallRule `
+              -DisplayName "GitHub RDP via Tailscale IPv6 ($protocol)" `
+              -Direction Inbound `
+              -Action Allow `
+              -Enabled True `
+              -Profile Any `
+              -Protocol $protocol `
+              -LocalPort 3389 `
+              -RemoteAddress "fd7a:115c:a1e0::/48" | Out-Null
+          }
+
+          # Prevent sleep or hibernation while the job remains active.
+          powercfg /change monitor-timeout-ac 0 | Out-Null
+          powercfg /change standby-timeout-ac 0 | Out-Null
+          powercfg /change hibernate-timeout-ac 0 | Out-Null
+
+          $listening = $false
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            if (Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue) {
+              $listening = $true
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $listening) {
+            throw "Remote Desktop service did not start listening on TCP/3389."
+          }
+
+      - name: Publish connection details
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+
+          $status = tailscale status --json | ConvertFrom-Json
+          if ($status.BackendState -ne "Running") {
+            throw "Tailscale is not running. BackendState: $($status.BackendState)"
+          }
+
+          $ipv4 = (tailscale ip -4 | Select-Object -First 1).Trim()
+          $dnsName = ([string]$status.Self.DNSName).TrimEnd('.')
+          $windowsCaption = (Get-CimInstance Win32_OperatingSystem).Caption
+
+          if ([string]::IsNullOrWhiteSpace($ipv4)) {
+            throw "Tailscale did not assign an IPv4 address."
+          }
+
+          @"
+          ## Windows remote development workstation is ready
+
+          - **Operating system:** ``$windowsCaption``
+          - **Tailscale IPv4:** ``$ipv4``
+          - **MagicDNS:** ``$dnsName``
+          - **Username:** ``$env:RDP_USERNAME``
+          - **Password:** value of the ``RDP_PASSWORD`` repository secret
+          - **Port:** ``3389``
+          - **Repository workspace:** ``$env:GITHUB_WORKSPACE``
+          - **Requested duration:** ``${{ inputs.duration_minutes }} minutes``
+
+          From a device connected to the same tailnet, open **Remote Desktop Connection** (`mstsc.exe`) and connect using the Tailscale IPv4 or MagicDNS name above.
+          Stop the workflow manually from the Actions page when you finish so the runner is destroyed immediately.
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          Write-Host "RDP endpoint: $ipv4"
+          Write-Host "MagicDNS name: $dnsName"
+          Write-Host "RDP username: $env:RDP_USERNAME"
+          Write-Host "Repository workspace: $env:GITHUB_WORKSPACE"
+
+      - name: Keep the remote development session available
+        env:
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+
+          $duration = [int]$env:DURATION_MINUTES
+          if ($duration -lt 60 -or $duration -gt 330) {
+            throw "duration_minutes must be between 60 and 330."
+          }
+
+          $finishAt = (Get-Date).AddMinutes($duration)
+
+          while ((Get-Date) -lt $finishAt) {
+            $status = tailscale status --json | ConvertFrom-Json
+            if ($status.BackendState -ne "Running") {
+              throw "Tailscale stopped unexpectedly. BackendState: $($status.BackendState)"
+            }
+
+            if (-not (Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue)) {
+              throw "RDP stopped listening on TCP/3389."
+            }
+
+            $remaining = [Math]::Max(0, [Math]::Ceiling(($finishAt - (Get-Date)).TotalMinutes))
+            Write-Host "Windows RDP session active. Approximately $remaining minute(s) remaining."
+            Start-Sleep -Seconds 300
+          }
+
+          Write-Host "Requested remote development duration completed."
