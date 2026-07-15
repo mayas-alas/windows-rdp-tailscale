@@ -1,0 +1,273 @@
+name: GNX Windows installer lifecycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_url:
+        description: Tailnet-only HTTPS URL for the frozen GNX setup EXE
+        required: true
+        type: string
+      expected_sha256:
+        description: Expected SHA256 for the setup EXE
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gnx-windows-installer-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  lifecycle:
+    name: Install, repair, and uninstall GNX
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      ARTIFACT_URL: ${{ inputs.artifact_url }}
+      EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+
+    steps:
+      - name: Validate inputs and required secrets
+        shell: pwsh
+        env:
+          TS_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_CLIENT_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $uri = [Uri]$env:ARTIFACT_URL
+          if ($uri.Scheme -ne "https" -or -not $uri.Host.EndsWith(".ts.net")) {
+              throw "artifact_url must be a tailnet-only HTTPS .ts.net URL."
+          }
+          if ($env:EXPECTED_SHA256 -notmatch "^[A-Fa-f0-9]{64}$") {
+              throw "expected_sha256 must contain exactly 64 hexadecimal characters."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TS_CLIENT_ID) -or
+              [string]::IsNullOrWhiteSpace($env:TS_CLIENT_SECRET)) {
+              throw "Tailscale OAuth secrets are not configured."
+          }
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:github-rdp
+          hostname: github-gnx-smoke-${{ github.run_id }}
+          version: latest
+          timeout: 3m
+          retry: "5"
+          use-cache: "true"
+          log-mode: normal
+
+      - name: Exercise frozen installer lifecycle
+        id: lifecycle
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $evidenceRoot = Join-Path $env:RUNNER_TEMP "gnx-evidence"
+          $setupPath = Join-Path $env:RUNNER_TEMP "Quetzalcoatl-setup.exe"
+          $summaryPath = Join-Path $evidenceRoot "summary.json"
+          New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
+
+          $summary = [ordered]@{
+              schemaVersion = 1
+              runId = $env:GITHUB_RUN_ID
+              runnerImage = $env:ImageOS
+              expectedSha256 = $env:EXPECTED_SHA256.ToLowerInvariant()
+              actualSha256 = $null
+              stage = "download"
+              result = "failed"
+              arpEntriesAfterInstall = @()
+              serviceRecovery = $null
+              sentinelSha256 = $null
+              error = $null
+          }
+
+          function Save-Summary {
+              $summary | ConvertTo-Json -Depth 8 |
+                  Set-Content -LiteralPath $summaryPath -Encoding utf8
+          }
+
+          function Invoke-Setup {
+              param(
+                  [Parameter(Mandatory = $true)][ValidateSet("install", "repair", "uninstall")][string]$Operation,
+                  [Parameter(Mandatory = $true)][string]$LogName
+              )
+
+              $logPath = Join-Path $evidenceRoot $LogName
+              $arguments = @(
+                  "/$Operation",
+                  "/quiet",
+                  "/norestart",
+                  "/log",
+                  "`"$logPath`""
+              )
+              $process = Start-Process -FilePath $setupPath -ArgumentList $arguments -Wait -PassThru
+              if ($process.ExitCode -notin @(0, 3010)) {
+                  throw "Setup $Operation failed with exit code $($process.ExitCode)."
+              }
+          }
+
+          function Get-GnxArpEntry {
+              $paths = @(
+                  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+              )
+              @(
+                  Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
+                      Where-Object { $_.DisplayName -like "Quetzalcoatl*" }
+              )
+          }
+
+          function Wait-ServiceState {
+              param(
+                  [Parameter(Mandatory = $true)][bool]$Present,
+                  [int]$Seconds = 60
+              )
+
+              $deadline = (Get-Date).AddSeconds($Seconds)
+              do {
+                  $service = Get-Service -Name "QuetzalcoatlSvc" -ErrorAction SilentlyContinue
+                  if ($Present -and $null -ne $service -and $service.Status -eq "Running") {
+                      return $service
+                  }
+                  if (-not $Present -and $null -eq $service) {
+                      return $null
+                  }
+                  Start-Sleep -Seconds 2
+              } while ((Get-Date) -lt $deadline)
+
+              if ($Present) {
+                  throw "QuetzalcoatlSvc did not reach Running state."
+              }
+              throw "QuetzalcoatlSvc still exists after uninstall."
+          }
+
+          try {
+              Invoke-WebRequest -Uri $env:ARTIFACT_URL -OutFile $setupPath
+              $actualHash = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              $summary.actualSha256 = $actualHash
+              if ($actualHash -ne $summary.expectedSha256) {
+                  throw "Downloaded setup SHA256 does not match the frozen input."
+              }
+
+              $summary.stage = "sentinel"
+              $stateRoot = Join-Path $env:ProgramData "Quetzalcoatl\state"
+              $sentinelPath = Join-Path $stateRoot "ephemeral-runner-sentinel.txt"
+              New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null
+              [IO.File]::WriteAllText($sentinelPath, "GNX installer lifecycle sentinel`r`n")
+              $sentinelHash = (Get-FileHash -LiteralPath $sentinelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              $summary.sentinelSha256 = $sentinelHash
+
+              $summary.stage = "install"
+              Save-Summary
+              Invoke-Setup -Operation install -LogName "install.log"
+              [void](Wait-ServiceState -Present $true)
+
+              $installEntries = @(Get-GnxArpEntry)
+              if ($installEntries.Count -ne 1) {
+                  throw "Expected one Quetzalcoatl Programs and Features entry; found $($installEntries.Count)."
+              }
+              $summary.arpEntriesAfterInstall = @($installEntries | ForEach-Object {
+                  [ordered]@{
+                      displayName = $_.DisplayName
+                      displayVersion = $_.DisplayVersion
+                      publisher = $_.Publisher
+                  }
+              })
+
+              $cliPath = Join-Path $env:ProgramFiles "Quetzalcoatl\gnx.exe"
+              if (-not (Test-Path -LiteralPath $cliPath -PathType Leaf)) {
+                  throw "Installed gnx.exe is missing."
+              }
+              & $cliPath --version 2>&1 |
+                  Set-Content -LiteralPath (Join-Path $evidenceRoot "gnx-version.txt") -Encoding utf8
+              if ($LASTEXITCODE -ne 0) {
+                  throw "gnx --version failed with exit code $LASTEXITCODE."
+              }
+              & $cliPath runtime status 2>&1 |
+                  Set-Content -LiteralPath (Join-Path $evidenceRoot "runtime-status.txt") -Encoding utf8
+              if ($LASTEXITCODE -ne 0) {
+                  throw "gnx runtime status failed with exit code $LASTEXITCODE."
+              }
+
+              $failureText = (& sc.exe qfailure QuetzalcoatlSvc 2>&1 | Out-String).Trim()
+              $failureText | Set-Content -LiteralPath (Join-Path $evidenceRoot "sc-qfailure.txt") -Encoding utf8
+              if ($LASTEXITCODE -ne 0 -or $failureText -notmatch "(?i)RESTART" -or $failureText -notmatch "10000") {
+                  throw "SCM recovery does not expose the reviewed restart policy."
+              }
+              $summary.serviceRecovery = $failureText
+
+              $summary.stage = "repair"
+              Save-Summary
+              Invoke-Setup -Operation repair -LogName "repair.log"
+              [void](Wait-ServiceState -Present $true)
+              if ((Get-FileHash -LiteralPath $sentinelPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $sentinelHash) {
+                  throw "Repair changed the preserved data sentinel."
+              }
+
+              $summary.stage = "uninstall"
+              Save-Summary
+              Invoke-Setup -Operation uninstall -LogName "uninstall.log"
+              [void](Wait-ServiceState -Present $false)
+              if (@(Get-GnxArpEntry).Count -ne 0) {
+                  throw "A Quetzalcoatl Programs and Features entry remains after uninstall."
+              }
+              if (Test-Path -LiteralPath $cliPath -PathType Leaf) {
+                  throw "gnx.exe remains after uninstall."
+              }
+              if ((Get-FileHash -LiteralPath $sentinelPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $sentinelHash) {
+                  throw "Uninstall removed or changed the preserved data sentinel."
+              }
+
+              $summary.stage = "complete"
+              $summary.result = "passed"
+          }
+          catch {
+              $summary.error = $_.Exception.Message
+              throw
+          }
+          finally {
+              Save-Summary
+          }
+
+      - name: Preserve lifecycle summary
+        if: always()
+        shell: pwsh
+        run: |
+          $summary = Join-Path $env:RUNNER_TEMP "gnx-evidence\summary.json"
+          if (Test-Path -LiteralPath $summary) {
+              "## GNX installer lifecycle" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              "``````json" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              Get-Content -LiteralPath $summary | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              "``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
+
+      - name: Cleanup GNX product state
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $setupPath = Join-Path $env:RUNNER_TEMP "Quetzalcoatl-setup.exe"
+          $cleanupLog = Join-Path $env:RUNNER_TEMP "gnx-evidence\cleanup.log"
+          if (Test-Path -LiteralPath $setupPath -PathType Leaf) {
+              $process = Start-Process -FilePath $setupPath `
+                  -ArgumentList @("/uninstall", "/quiet", "/norestart", "/log", "`"$cleanupLog`"") `
+                  -Wait -PassThru
+              Write-Host "Cleanup uninstall exit code: $($process.ExitCode)"
+          }
+
+      - name: Upload short-lived lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnx-windows-lifecycle-${{ github.run_id }}
+          path: ${{ runner.temp }}/gnx-evidence
+          retention-days: 1
+          if-no-files-found: warn
