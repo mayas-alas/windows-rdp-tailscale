@@ -11,6 +11,10 @@ on:
         description: Expected SHA256 for the setup EXE
         required: true
         type: string
+      expected_msi_sha256:
+        description: Expected SHA256 for the GNX MSI fallback
+        required: true
+        type: string
 
 permissions:
   # Draft releases are visible only to collaborators; the ephemeral job token
@@ -32,6 +36,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ inputs.release_tag }}
       EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+      EXPECTED_MSI_SHA256: ${{ inputs.expected_msi_sha256 }}
 
     steps:
       - name: Validate inputs
@@ -45,6 +50,9 @@ jobs:
           if ($env:EXPECTED_SHA256 -notmatch "^[A-Fa-f0-9]{64}$") {
               throw "expected_sha256 must contain exactly 64 hexadecimal characters."
           }
+          if ($env:EXPECTED_MSI_SHA256 -notmatch "^[A-Fa-f0-9]{64}$") {
+              throw "expected_msi_sha256 must contain exactly 64 hexadecimal characters."
+          }
 
       - name: Exercise frozen installer lifecycle
         id: lifecycle
@@ -56,6 +64,7 @@ jobs:
 
           $evidenceRoot = Join-Path $env:RUNNER_TEMP "gnx-evidence"
           $setupPath = Join-Path $env:RUNNER_TEMP "Quetzalcoatl-setup.exe"
+          $msiPath = Join-Path $env:RUNNER_TEMP "Quetzalcoatl.msi"
           $summaryPath = Join-Path $evidenceRoot "summary.json"
           New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
 
@@ -65,11 +74,22 @@ jobs:
               runnerImage = $env:ImageOS
               expectedSha256 = $env:EXPECTED_SHA256.ToLowerInvariant()
               actualSha256 = $null
-              stage = "download"
+              expectedMsiSha256 = $env:EXPECTED_MSI_SHA256.ToLowerInvariant()
+              actualMsiSha256 = $null
+              stage = "capability"
               result = "failed"
+              lifecycleMode = $null
+              capability = $null
+              capabilityReasons = @()
+              rebootRequired = $false
               arpEntriesAfterInstall = @()
               visibleArpEntriesAfterInstall = @()
+              serviceIdentity = $null
               serviceRecovery = $null
+              identityPolicy = $null
+              preservation = $null
+              runtimeStatus = $null
+              secretLogScan = "not-run"
               sentinelSha256 = $null
               error = $null
           }
@@ -94,8 +114,245 @@ jobs:
                   "`"$logPath`""
               )
               $process = Start-Process -FilePath $setupPath -ArgumentList $arguments -Wait -PassThru
-              if ($process.ExitCode -notin @(0, 3010)) {
+              if ($process.ExitCode -eq 3010) {
+                  $summary.rebootRequired = $true
+                  Save-Summary
+                  throw "Setup $Operation requires a reboot; this ephemeral run cannot continue safely."
+              }
+              if ($process.ExitCode -ne 0) {
                   throw "Setup $Operation failed with exit code $($process.ExitCode)."
+              }
+          }
+
+          function Invoke-Msi {
+              param(
+                  [Parameter(Mandatory = $true)][ValidateSet("install", "repair", "uninstall")][string]$Operation,
+                  [Parameter(Mandatory = $true)][string]$LogName
+              )
+
+              $logPath = Join-Path $evidenceRoot $LogName
+              $arguments = switch ($Operation) {
+                  "install" { @("/i", "`"$msiPath`"") }
+                  "repair" { @("/fvomus", "`"$msiPath`"") }
+                  "uninstall" { @("/x", "`"$msiPath`"") }
+              }
+              $arguments += @("/qn", "/norestart", "/L*v", "`"$logPath`"")
+              $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" `
+                  -ArgumentList $arguments -Wait -PassThru
+              if ($process.ExitCode -eq 3010) {
+                  $summary.rebootRequired = $true
+                  Save-Summary
+                  throw "MSI $Operation requires a reboot; this ephemeral run cannot continue safely."
+              }
+              if ($process.ExitCode -ne 0) {
+                  throw "MSI $Operation failed with exit code $($process.ExitCode)."
+              }
+          }
+
+          function Invoke-Product {
+              param(
+                  [Parameter(Mandatory = $true)][ValidateSet("install", "repair", "uninstall")][string]$Operation,
+                  [Parameter(Mandatory = $true)][string]$LogName
+              )
+
+              if ($summary.lifecycleMode -eq "full-bundle") {
+                  Invoke-Setup -Operation $Operation -LogName $LogName
+              }
+              else {
+                  Invoke-Msi -Operation $Operation -LogName $LogName
+              }
+          }
+
+          function Get-FeatureState {
+              param([Parameter(Mandatory = $true)][string]$Name)
+              try {
+                  return [string](Get-WindowsOptionalFeature -Online -FeatureName $Name).State
+              }
+              catch {
+                  return "Unavailable"
+              }
+          }
+
+          function Get-AccountAclMask {
+              param(
+                  [Parameter(Mandatory = $true)][string]$Path,
+                  [Parameter(Mandatory = $true)][string]$Sid
+              )
+
+              $mask = [int64]0
+              foreach ($rule in @(Get-Acl -LiteralPath $Path).Access) {
+                  try {
+                      $ruleSid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+                  }
+                  catch {
+                      continue
+                  }
+                  if ($ruleSid -eq $Sid) {
+                      $mask = $mask -bor [int64]$rule.FileSystemRights
+                  }
+              }
+              return $mask
+          }
+
+          function Get-IdentityPolicySnapshot {
+              param([Parameter(Mandatory = $true)][string]$Label)
+
+              $accountName = "$env:COMPUTERNAME\QuetzalcoatlRuntime"
+              $accountSid = ([Security.Principal.NTAccount]::new($accountName)).Translate([Security.Principal.SecurityIdentifier]).Value
+              $localUser = Get-LocalUser -Name "QuetzalcoatlRuntime" -ErrorAction Stop
+              $administratorsSid = [Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+              $isAdministrator = @(
+                  Get-LocalGroupMember -SID $administratorsSid -ErrorAction SilentlyContinue |
+                      Where-Object { $_.SID.Value -eq $accountSid }
+              ).Count -ne 0
+
+              $profileKey = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$accountSid"
+              $profilePath = [Environment]::ExpandEnvironmentVariables(
+                  [string](Get-ItemPropertyValue -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop)
+              )
+              $secretPath = Join-Path $env:ProgramData "Quetzalcoatl\secrets\runtime-account.v1.dpapi"
+              $markerPath = Join-Path $env:ProgramData "Quetzalcoatl\state\install-commit.v1"
+              foreach ($requiredPath in @($profilePath, $secretPath, $markerPath)) {
+                  if (-not (Test-Path -LiteralPath $requiredPath)) {
+                      throw "Managed identity preservation path is missing."
+                  }
+              }
+
+              $rightsPath = Join-Path $evidenceRoot "user-rights-$Label.inf"
+              & secedit.exe /export /cfg $rightsPath /areas USER_RIGHTS /quiet | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Could not export local user-rights policy."
+              }
+              $rights = @{}
+              foreach ($line in @(Get-Content -LiteralPath $rightsPath)) {
+                  if ($line -match '^(?<name>Se\w+)\s*=\s*(?<values>.*)$') {
+                      $rights[$Matches.name] = @($Matches.values -split ',' | ForEach-Object {
+                          $_.Trim().TrimStart('*')
+                      })
+                  }
+              }
+              $hasServiceLogon = @($rights['SeServiceLogonRight']) -contains $accountSid
+              $hasDenyInteractive = @($rights['SeDenyInteractiveLogonRight']) -contains $accountSid
+              $hasDenyRemoteInteractive = @($rights['SeDenyRemoteInteractiveLogonRight']) -contains $accountSid
+
+              $dataRoot = Join-Path $env:ProgramData "Quetzalcoatl"
+              $aclMasks = [ordered]@{
+                  root = Get-AccountAclMask -Path $dataRoot -Sid $accountSid
+                  config = Get-AccountAclMask -Path (Join-Path $dataRoot "config") -Sid $accountSid
+                  state = Get-AccountAclMask -Path (Join-Path $dataRoot "state") -Sid $accountSid
+                  logs = Get-AccountAclMask -Path (Join-Path $dataRoot "logs") -Sid $accountSid
+                  diagnostics = Get-AccountAclMask -Path (Join-Path $dataRoot "diagnostics") -Sid $accountSid
+                  secrets = Get-AccountAclMask -Path (Join-Path $dataRoot "secrets") -Sid $accountSid
+              }
+              $readExecute = [int64][Security.AccessControl.FileSystemRights]::ReadAndExecute
+              $write = [int64][Security.AccessControl.FileSystemRights]::Write
+              $modify = [int64][Security.AccessControl.FileSystemRights]::Modify
+              $fullControl = [int64][Security.AccessControl.FileSystemRights]::FullControl
+              $readOnlyAcl = {
+                  param([int64]$Mask)
+                  return ($Mask -band $readExecute) -eq $readExecute -and ($Mask -band $write) -eq 0
+              }
+              $modifyAcl = {
+                  param([int64]$Mask)
+                  return ($Mask -band $modify) -eq $modify -and ($Mask -band $fullControl) -ne $fullControl
+              }
+              $aclContract = (& $readOnlyAcl $aclMasks.root) -and
+                  (& $readOnlyAcl $aclMasks.config) -and
+                  (& $modifyAcl $aclMasks.state) -and
+                  (& $modifyAcl $aclMasks.logs) -and
+                  (& $modifyAcl $aclMasks.diagnostics) -and
+                  $aclMasks.secrets -eq 0
+
+              if (-not $localUser.Enabled -or $isAdministrator -or
+                  -not $hasServiceLogon -or -not $hasDenyInteractive -or
+                  -not $hasDenyRemoteInteractive -or -not $aclContract) {
+                  throw "Managed account, rights, or scoped ACL policy differs from the reviewed contract."
+              }
+
+              return [pscustomobject][ordered]@{
+                  sid = $accountSid
+                  enabled = [bool]$localUser.Enabled
+                  administrator = [bool]$isAdministrator
+                  profilePath = $profilePath
+                  profileExists = [bool](Test-Path -LiteralPath $profilePath -PathType Container)
+                  serviceLogon = [bool]$hasServiceLogon
+                  denyInteractive = [bool]$hasDenyInteractive
+                  denyRemoteInteractive = [bool]$hasDenyRemoteInteractive
+                  aclMasks = $aclMasks
+                  credentialSha256 = (Get-FileHash -LiteralPath $secretPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                  commitMarkerSha256 = (Get-FileHash -LiteralPath $markerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              }
+          }
+
+          function Get-ServiceContract {
+              param([Parameter(Mandatory = $true)][string]$Label)
+
+              $service = Get-CimInstance Win32_Service -Filter "Name='QuetzalcoatlSvc'"
+              if ($null -eq $service -or $service.State -ne "Running" -or
+                  $service.StartName -ne "$env:COMPUTERNAME\QuetzalcoatlRuntime") {
+                  throw "SCM does not expose the reviewed running local identity."
+              }
+              $expectedServicePath = Join-Path $env:ProgramFiles "Quetzalcoatl\QuetzalcoatlSvc.exe"
+              if ($service.PathName.Trim('"') -ne $expectedServicePath) {
+                  throw "SCM does not expose the reviewed WinSW executable."
+              }
+              $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($service.ProcessId)"
+              if ($null -eq $process) {
+                  throw "The WinSW service process is unavailable."
+              }
+              $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwner
+              if ($owner.ReturnValue -ne 0 -or $owner.User -ne "QuetzalcoatlRuntime" -or $owner.Domain -ne $env:COMPUTERNAME) {
+                  throw "The running service process does not use the reviewed local identity."
+              }
+              $accountSid = ([Security.Principal.NTAccount]::new("$env:COMPUTERNAME\QuetzalcoatlRuntime")).Translate([Security.Principal.SecurityIdentifier]).Value
+              $failureText = (& sc.exe qfailure QuetzalcoatlSvc 2>&1 | Out-String).Trim()
+              $failureExitCode = $LASTEXITCODE
+              $failureText | Set-Content -LiteralPath (Join-Path $evidenceRoot "sc-qfailure-$Label.txt") -Encoding utf8
+              if ($failureExitCode -ne 0 -or $failureText -notmatch "(?i)RESTART" -or $failureText -notmatch "10000") {
+                  throw "SCM recovery does not expose the reviewed restart policy."
+              }
+              return [pscustomobject][ordered]@{
+                  startName = [string]$service.StartName
+                  processOwner = "$($owner.Domain)\$($owner.User)"
+                  servicePath = [string]$service.PathName
+                  accountSid = $accountSid
+                  recovery = $failureText
+              }
+          }
+
+          function Get-SemanticRuntimeStatus {
+              param(
+                  [Parameter(Mandatory = $true)][string]$CliPath,
+                  [Parameter(Mandatory = $true)][string]$Mode
+              )
+
+              $deadline = (Get-Date).AddSeconds(90)
+              do {
+                  $output = (& $CliPath runtime status 2>&1 | Out-String).Trim()
+                  $exitCode = $LASTEXITCODE
+                  $machineMatches = $output -match '(?im)^Machine:\s*quetzalcoatl-machine\s*$'
+                  $stateMatches = if ($Mode -eq "full-bundle") {
+                      $output -match '(?im)^State:\s*running\s*$'
+                  }
+                  else {
+                      $output -match '(?im)^State:\s*(stopped|degraded)\s*$'
+                  }
+                  if ($exitCode -eq 0 -and $machineMatches -and $stateMatches) {
+                      return $output
+                  }
+                  Start-Sleep -Seconds 3
+              } while ((Get-Date) -lt $deadline)
+              throw "GNX runtime status did not reach the exact state supported by this host."
+          }
+
+          function Assert-SnapshotEqual {
+              param(
+                  [Parameter(Mandatory = $true)]$Expected,
+                  [Parameter(Mandatory = $true)]$Actual,
+                  [Parameter(Mandatory = $true)][string]$Description
+              )
+              if (($Expected | ConvertTo-Json -Depth 8 -Compress) -ne ($Actual | ConvertTo-Json -Depth 8 -Compress)) {
+                  throw "$Description changed managed identity or preserved state."
               }
           }
 
@@ -174,21 +431,92 @@ jobs:
           }
 
           try {
+              $os = Get-CimInstance Win32_OperatingSystem
+              $computer = Get-CimInstance Win32_ComputerSystem
+              $processors = @(Get-CimInstance Win32_Processor)
+              $windowsVersion = [version]$os.Version
+              $memoryMiB = [math]::Floor([double]$computer.TotalPhysicalMemory / 1MB)
+              $requiredMemoryMiB = 10240
+              $wslFeature = Get-FeatureState -Name "Microsoft-Windows-Subsystem-Linux"
+              $vmPlatformFeature = Get-FeatureState -Name "VirtualMachinePlatform"
+              $wslCommand = Get-Command wsl.exe -ErrorAction SilentlyContinue
+              $wslStatusExitCode = $null
+              $wslStatus = "wsl.exe unavailable"
+              if ($null -ne $wslCommand) {
+                  $wslStatus = (& $wslCommand.Source --status 2>&1 | Out-String).Trim()
+                  $wslStatusExitCode = $LASTEXITCODE
+              }
+              $pendingReboot =
+                  (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") -or
+                  (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") -or
+                  ($null -ne (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue))
+              $virtualizationSignals = @($processors | ForEach-Object {
+                  [ordered]@{
+                      virtualizationFirmwareEnabled = [bool]$_.VirtualizationFirmwareEnabled
+                      slat = [bool]$_.SecondLevelAddressTranslationExtensions
+                      vmMonitorMode = [bool]$_.VMMonitorModeExtensions
+                  }
+              })
+              $allFirmwareEnabled = $processors.Count -gt 0 -and
+                  @($processors | Where-Object { -not $_.VirtualizationFirmwareEnabled }).Count -eq 0
+              $allSlat = $processors.Count -gt 0 -and
+                  @($processors | Where-Object { -not $_.SecondLevelAddressTranslationExtensions }).Count -eq 0
+              $allVmMonitor = $processors.Count -gt 0 -and
+                  @($processors | Where-Object { -not $_.VMMonitorModeExtensions }).Count -eq 0
+              $virtualizationProven = [bool]$computer.HypervisorPresent -and
+                  $allFirmwareEnabled -and $allSlat -and $allVmMonitor
+              $providerAvailable = $wslFeature -eq "Enabled" -and
+                  $vmPlatformFeature -eq "Enabled" -and $wslStatusExitCode -eq 0
+              $capabilityReasons = [System.Collections.Generic.List[string]]::new()
+              if ($windowsVersion -lt [version]"10.0.19045") { $capabilityReasons.Add("unsupported-windows-version") }
+              if ($memoryMiB -lt $requiredMemoryMiB) { $capabilityReasons.Add("insufficient-memory") }
+              if ($pendingReboot) { $capabilityReasons.Add("pending-reboot") }
+              if (-not $virtualizationProven) { $capabilityReasons.Add("nested-virtualization-not-proven") }
+              if (-not $providerAvailable) { $capabilityReasons.Add("wsl2-provider-not-ready") }
+              $eligible = $capabilityReasons.Count -eq 0
+              $summary.capability = [ordered]@{
+                  windowsCaption = [string]$os.Caption
+                  windowsVersion = [string]$os.Version
+                  memoryMiB = $memoryMiB
+                  requiredMemoryMiB = $requiredMemoryMiB
+                  hypervisorPresent = [bool]$computer.HypervisorPresent
+                  virtualizationSignals = $virtualizationSignals
+                  virtualizationProven = [bool]$virtualizationProven
+                  wslFeature = $wslFeature
+                  virtualMachinePlatformFeature = $vmPlatformFeature
+                  wslStatusExitCode = $wslStatusExitCode
+                  wslStatus = $wslStatus
+                  pendingReboot = [bool]$pendingReboot
+                  eligibleForManagedMachine = [bool]$eligible
+              }
+              $summary.capabilityReasons = @($capabilityReasons)
+              $summary.lifecycleMode = if ($eligible) { "full-bundle" } else { "msi-supported-subset" }
+              Save-Summary
+
+              $summary.stage = "download"
               $assetName = "Quetzalcoatl-0.3.0-preview-setup-x64.exe"
+              $msiAssetName = "Quetzalcoatl-0.3.0-preview-x64.msi"
               gh release download $env:RELEASE_TAG `
                   --repo $env:GITHUB_REPOSITORY `
-                  --pattern $assetName `
+                  --pattern "Quetzalcoatl-0.3.0-preview-*" `
                   --dir $env:RUNNER_TEMP `
                   --clobber
               if ($LASTEXITCODE -ne 0) {
                   throw "Could not download the frozen setup from the temporary draft release."
               }
               $downloadedPath = Join-Path $env:RUNNER_TEMP $assetName
+              $downloadedMsiPath = Join-Path $env:RUNNER_TEMP $msiAssetName
               Move-Item -LiteralPath $downloadedPath -Destination $setupPath -Force
+              Move-Item -LiteralPath $downloadedMsiPath -Destination $msiPath -Force
               $actualHash = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              $actualMsiHash = (Get-FileHash -LiteralPath $msiPath -Algorithm SHA256).Hash.ToLowerInvariant()
               $summary.actualSha256 = $actualHash
+              $summary.actualMsiSha256 = $actualMsiHash
               if ($actualHash -ne $summary.expectedSha256) {
                   throw "Downloaded setup SHA256 does not match the frozen input."
+              }
+              if ($actualMsiHash -ne $summary.expectedMsiSha256) {
+                  throw "Downloaded MSI SHA256 does not match the frozen input."
               }
 
               $summary.stage = "sentinel"
@@ -201,7 +529,7 @@ jobs:
 
               $summary.stage = "install"
               Save-Summary
-              Invoke-Setup -Operation install -LogName "install.log"
+              Invoke-Product -Operation install -LogName "install.log"
               [void](Wait-ServiceState -Present $true)
 
               $installEntries = @(Get-GnxArpEntry)
@@ -231,8 +559,9 @@ jobs:
                   }
               })
               Save-Summary
-              if ($visibleEntries.Count -ne 1) {
-                  throw "Expected one visible Quetzalcoatl Programs and Features entry; found $($visibleEntries.Count)."
+              $expectedVisibleCount = if ($summary.lifecycleMode -eq "full-bundle") { 1 } else { 0 }
+              if ($visibleEntries.Count -ne $expectedVisibleCount) {
+                  throw "Expected $expectedVisibleCount visible Quetzalcoatl Programs and Features entries; found $($visibleEntries.Count)."
               }
               if ($hiddenEntries.Count -ne 1 -or
                   $hiddenEntries[0].DisplayName -ne "Quetzalcoatl 0.3 Preview") {
@@ -248,30 +577,44 @@ jobs:
               if ($LASTEXITCODE -ne 0) {
                   throw "gnx --version failed with exit code $LASTEXITCODE."
               }
-              & $cliPath runtime status 2>&1 |
-                  Set-Content -LiteralPath (Join-Path $evidenceRoot "runtime-status.txt") -Encoding utf8
-              if ($LASTEXITCODE -ne 0) {
-                  throw "gnx runtime status failed with exit code $LASTEXITCODE."
-              }
+              $runtimeStatus = Get-SemanticRuntimeStatus -CliPath $cliPath -Mode $summary.lifecycleMode
+              $runtimeStatus | Set-Content -LiteralPath (Join-Path $evidenceRoot "runtime-status.txt") -Encoding utf8
+              $summary.runtimeStatus = $runtimeStatus
+              $serviceAfterInstall = Get-ServiceContract -Label "after-install"
+              $identityBeforeRepair = Get-IdentityPolicySnapshot -Label "before-repair"
+              $summary.serviceIdentity = [ordered]@{ afterInstall = $serviceAfterInstall }
+              $summary.serviceRecovery = [ordered]@{ afterInstall = $serviceAfterInstall.recovery }
+              $summary.identityPolicy = [ordered]@{ beforeRepair = $identityBeforeRepair }
 
-              $failureText = (& sc.exe qfailure QuetzalcoatlSvc 2>&1 | Out-String).Trim()
-              $failureText | Set-Content -LiteralPath (Join-Path $evidenceRoot "sc-qfailure.txt") -Encoding utf8
-              if ($LASTEXITCODE -ne 0 -or $failureText -notmatch "(?i)RESTART" -or $failureText -notmatch "10000") {
-                  throw "SCM recovery does not expose the reviewed restart policy."
+              $serviceControl = Get-Service -Name "QuetzalcoatlSvc" -ErrorAction Stop
+              Stop-Service -InputObject $serviceControl -Force -ErrorAction Stop
+              $serviceControl.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [timespan]::FromSeconds(30))
+              $driftText = (& sc.exe config QuetzalcoatlSvc obj= LocalSystem 2>&1 | Out-String).Trim()
+              $driftExitCode = $LASTEXITCODE
+              $driftText | Set-Content -LiteralPath (Join-Path $evidenceRoot "sc-drift.txt") -Encoding utf8
+              if ($driftExitCode -ne 0 -or (Get-CimInstance Win32_Service -Filter "Name='QuetzalcoatlSvc'").StartName -ne "LocalSystem") {
+                  throw "Could not establish the authorized service-identity drift fixture."
               }
-              $summary.serviceRecovery = $failureText
 
               $summary.stage = "repair"
               Save-Summary
-              Invoke-Setup -Operation repair -LogName "repair.log"
+              Invoke-Product -Operation repair -LogName "repair.log"
               [void](Wait-ServiceState -Present $true)
+              $serviceAfterRepair = Get-ServiceContract -Label "after-repair"
+              $identityAfterRepair = Get-IdentityPolicySnapshot -Label "after-repair"
+              Assert-SnapshotEqual -Expected $identityBeforeRepair -Actual $identityAfterRepair -Description "Repair"
+              $runtimeStatusAfterRepair = Get-SemanticRuntimeStatus -CliPath $cliPath -Mode $summary.lifecycleMode
+              $runtimeStatusAfterRepair | Set-Content -LiteralPath (Join-Path $evidenceRoot "runtime-status-after-repair.txt") -Encoding utf8
               if ((Get-FileHash -LiteralPath $sentinelPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $sentinelHash) {
                   throw "Repair changed the preserved data sentinel."
               }
+              $summary.serviceIdentity['afterRepair'] = $serviceAfterRepair
+              $summary.serviceRecovery['afterRepair'] = $serviceAfterRepair.recovery
+              $summary.identityPolicy['afterRepair'] = $identityAfterRepair
 
               $summary.stage = "uninstall"
               Save-Summary
-              Invoke-Setup -Operation uninstall -LogName "uninstall.log"
+              Invoke-Product -Operation uninstall -LogName "uninstall.log"
               [void](Wait-ServiceState -Present $false)
               if (@(Get-GnxArpEntry).Count -ne 0) {
                   throw "A Quetzalcoatl Programs and Features entry remains after uninstall."
@@ -282,6 +625,35 @@ jobs:
               if ((Get-FileHash -LiteralPath $sentinelPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $sentinelHash) {
                   throw "Uninstall removed or changed the preserved data sentinel."
               }
+              $identityAfterUninstall = Get-IdentityPolicySnapshot -Label "after-uninstall"
+              Assert-SnapshotEqual -Expected $identityBeforeRepair -Actual $identityAfterUninstall -Description "Normal uninstall"
+              $summary.identityPolicy['afterUninstall'] = $identityAfterUninstall
+              $summary.preservation = [ordered]@{
+                  sentinelSha256 = $sentinelHash
+                  accountSid = $identityAfterUninstall.sid
+                  profilePath = $identityAfterUninstall.profilePath
+                  credentialSha256 = $identityAfterUninstall.credentialSha256
+                  commitMarkerSha256 = $identityAfterUninstall.commitMarkerSha256
+                  managedMachine = if ($summary.lifecycleMode -eq "full-bundle") { "runtime-running-before-uninstall; profile retained" } else { "unsupported-on-host" }
+                  volumes = if ($summary.lifecycleMode -eq "full-bundle") { "managed profile retained; destructive provider calls forbidden by installer policy" } else { "unsupported-on-host" }
+              }
+
+              $unsafeSecretLogs = @()
+              foreach ($log in @(Get-ChildItem -LiteralPath $evidenceRoot -Filter "*.log" -File)) {
+                  foreach ($line in @(Get-Content -LiteralPath $log.FullName)) {
+                      if ($line -match '(?i)(GNX_RUNTIME_PASSWORD|GNX_CREDENTIAL_BLOB)\s*=\s*(?<value>.+)$') {
+                          $value = $Matches.value.Trim()
+                          if ($value -notmatch '^\*+$' -and $value -ne '(Hidden)') {
+                              $unsafeSecretLogs += $log.Name
+                              break
+                          }
+                      }
+                  }
+              }
+              if ($unsafeSecretLogs.Count -ne 0) {
+                  throw "Installer logs contain an unredacted managed-identity property in: $(@($unsafeSecretLogs | Sort-Object -Unique) -join ', ')."
+              }
+              $summary.secretLogScan = "passed"
 
               $summary.stage = "complete"
               $summary.result = "passed"
@@ -312,12 +684,58 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           $setupPath = Join-Path $env:RUNNER_TEMP "Quetzalcoatl-setup.exe"
+          $msiPath = Join-Path $env:RUNNER_TEMP "Quetzalcoatl.msi"
           $cleanupLog = Join-Path $env:RUNNER_TEMP "gnx-evidence\cleanup.log"
           if (Test-Path -LiteralPath $setupPath -PathType Leaf) {
               $process = Start-Process -FilePath $setupPath `
                   -ArgumentList @("/uninstall", "/quiet", "/norestart", "/log", "`"$cleanupLog`"") `
                   -Wait -PassThru
               Write-Host "Cleanup uninstall exit code: $($process.ExitCode)"
+          }
+          if (Test-Path -LiteralPath $msiPath -PathType Leaf) {
+              $msiCleanupLog = Join-Path $env:RUNNER_TEMP "gnx-evidence\cleanup-msi.log"
+              $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" `
+                  -ArgumentList @("/x", "`"$msiPath`"", "/qn", "/norestart", "/L*v", "`"$msiCleanupLog`"") `
+                  -Wait -PassThru
+              Write-Host "Cleanup MSI uninstall exit code: $($process.ExitCode)"
+          }
+
+      - name: Fail closed and redact managed-identity log properties
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $evidenceRoot = Join-Path $env:RUNNER_TEMP "gnx-evidence"
+          $summaryPath = Join-Path $evidenceRoot "summary.json"
+          $redacted = $false
+          foreach ($log in @(Get-ChildItem -LiteralPath $evidenceRoot -Filter "*.log" -File -Recurse -ErrorAction SilentlyContinue)) {
+              $lines = @(Get-Content -LiteralPath $log.FullName)
+              $changed = $false
+              for ($index = 0; $index -lt $lines.Count; $index++) {
+                  if ($lines[$index] -match '(?i)(GNX_RUNTIME_PASSWORD|GNX_CREDENTIAL_BLOB)\s*=\s*(?<value>.+)$') {
+                      $value = $Matches.value.Trim()
+                      if ($value -notmatch '^\*+$' -and $value -ne '(Hidden)' -and $value -ne '[REDACTED]') {
+                          $lines[$index] = [regex]::Replace(
+                              $lines[$index],
+                              '(?i)(GNX_RUNTIME_PASSWORD|GNX_CREDENTIAL_BLOB)\s*=.*$',
+                              '$1 = [REDACTED]'
+                          )
+                          $changed = $true
+                          $redacted = $true
+                      }
+                  }
+              }
+              if ($changed) {
+                  $lines | Set-Content -LiteralPath $log.FullName -Encoding utf8
+              }
+          }
+          if (Test-Path -LiteralPath $summaryPath -PathType Leaf) {
+              $summary = Get-Content -Raw -LiteralPath $summaryPath | ConvertFrom-Json
+              $summary.secretLogScan = if ($redacted) { "redacted-failed" } else { "passed" }
+              $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $summaryPath -Encoding utf8
+          }
+          if ($redacted) {
+              throw "Managed-identity values were redacted from installer evidence; the lifecycle is not acceptable."
           }
 
       - name: Upload short-lived lifecycle evidence
