@@ -105,7 +105,10 @@ jobs:
               )
               @(
                   Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
-                      Where-Object { $_.DisplayName -like "Quetzalcoatl*" }
+                      Where-Object {
+                          $null -ne $_.PSObject.Properties["DisplayName"] -and
+                          [string]$_.DisplayName -like "Quetzalcoatl*"
+                      }
               )
           }
 
