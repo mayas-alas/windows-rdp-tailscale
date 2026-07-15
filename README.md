@@ -1,10 +1,10 @@
 # windows-rdp-tailscale
 El workflow crea un Windows Server 2025 efímero, descarga tu repositorio, instala Tailscale, crea el usuario administrador ghrdp, habilita RDP con NLA/TLS y permite el puerto 3389 únicamente desde rangos de Tailscale. Las acciones están fijadas por SHA para evitar cambios inesperados. Validé la estructura YAML y los parámetros contra las acciones actuales de Tailscale y actions/checkout.
 
-1. Configura el tag en Tailscale
+## 1. Configura el tag en Tailscale
 
 En Tailscale Admin Console → Access controls, integra estas entradas en tu política actual. No reemplaces todo el archivo si ya tienes reglas:
-
+---
 {
   "tagOwners": {
     "tag:github-rdp": []
@@ -18,10 +18,10 @@ En Tailscale Admin Console → Access controls, integra estas entradas en tu pol
     }
   ]
 }
-
+---
 Reemplaza el correo con el que utilizas para iniciar sesión en Tailscale. La política concede RDP solamente a tus dispositivos y solamente hacia la VM etiquetada como tag:github-rdp. Tailscale recomienda usar grants para configuraciones nuevas y admite restricciones por protocolo y puerto.
 
-2. Crea las credenciales OAuth de Tailscale
+## 2. Crea las credenciales OAuth de Tailscale
 
 En:
 
@@ -41,7 +41,7 @@ Client secret
 
 El scope auth_keys y el tag del cliente deben coincidir con tag:github-rdp. El nodo creado por la acción es efímero y Tailscale lo elimina al terminar el job.
 
-3. Crea tres Secrets en GitHub
+## 3. Crea tres Secrets en GitHub
 
 En el repositorio:
 
@@ -76,7 +76,7 @@ $bytes = [byte[]]::new(24)
 
 No recomiendo hardcodearla en el YAML: quedaría guardada en el historial Git y potencialmente visible para personas con acceso al repositorio. Tailscale también recomienda mantener OAuth secrets fuera del código fuente.
 
-4. Ejecútalo
+## 4. Ejecútalo
 
 En GitHub:
 
