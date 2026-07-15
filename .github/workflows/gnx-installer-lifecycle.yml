@@ -99,17 +99,53 @@ jobs:
           }
 
           function Get-GnxArpEntry {
-              $paths = @(
-                  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-                  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-              )
-              @(
-                  Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
-                      Where-Object {
-                          $null -ne $_.PSObject.Properties["DisplayName"] -and
-                          [string]$_.DisplayName -like "Quetzalcoatl*"
+              foreach ($view in @(
+                  [Microsoft.Win32.RegistryView]::Registry64,
+                  [Microsoft.Win32.RegistryView]::Registry32
+              )) {
+                  $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                      [Microsoft.Win32.RegistryHive]::LocalMachine,
+                      $view
+                  )
+                  $uninstall = $null
+                  try {
+                      $uninstall = $baseKey.OpenSubKey(
+                          "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+                      )
+                      if ($null -eq $uninstall) {
+                          continue
                       }
-              )
+                      foreach ($keyName in $uninstall.GetSubKeyNames()) {
+                          $entry = $uninstall.OpenSubKey($keyName)
+                          if ($null -eq $entry) {
+                              continue
+                          }
+                          try {
+                              $displayName = [string]$entry.GetValue("DisplayName", "")
+                              if ($displayName -notlike "Quetzalcoatl*") {
+                                  continue
+                              }
+                              [pscustomobject]@{
+                                  RegistryView = $view.ToString()
+                                  RegistryKey = $keyName
+                                  DisplayName = $displayName
+                                  DisplayVersion = [string]$entry.GetValue("DisplayVersion", "")
+                                  Publisher = [string]$entry.GetValue("Publisher", "")
+                                  SystemComponent = $entry.GetValue("SystemComponent", $null)
+                              }
+                          }
+                          finally {
+                              $entry.Dispose()
+                          }
+                      }
+                  }
+                  finally {
+                      if ($null -ne $uninstall) {
+                          $uninstall.Dispose()
+                      }
+                      $baseKey.Dispose()
+                  }
+              }
           }
 
           function Wait-ServiceState {
@@ -168,16 +204,20 @@ jobs:
               [void](Wait-ServiceState -Present $true)
 
               $installEntries = @(Get-GnxArpEntry)
-              if ($installEntries.Count -ne 1) {
-                  throw "Expected one Quetzalcoatl Programs and Features entry; found $($installEntries.Count)."
-              }
               $summary.arpEntriesAfterInstall = @($installEntries | ForEach-Object {
                   [ordered]@{
+                      registryView = $_.RegistryView
+                      registryKey = $_.RegistryKey
                       displayName = $_.DisplayName
                       displayVersion = $_.DisplayVersion
                       publisher = $_.Publisher
+                      systemComponent = $_.SystemComponent
                   }
               })
+              Save-Summary
+              if ($installEntries.Count -ne 1) {
+                  throw "Expected one Quetzalcoatl Programs and Features entry; found $($installEntries.Count)."
+              }
 
               $cliPath = Join-Path $env:ProgramFiles "Quetzalcoatl\gnx.exe"
               if (-not (Test-Path -LiteralPath $cliPath -PathType Leaf)) {
