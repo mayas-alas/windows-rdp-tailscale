@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       artifact_url:
-        description: Tailnet-only HTTPS URL for the frozen GNX setup EXE
+        description: Tailnet-only HTTP(S) URL for the frozen GNX setup EXE
         required: true
         type: string
       expected_sha256:
@@ -38,8 +38,8 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $uri = [Uri]$env:ARTIFACT_URL
-          if ($uri.Scheme -ne "https" -or -not $uri.Host.EndsWith(".ts.net")) {
-              throw "artifact_url must be a tailnet-only HTTPS .ts.net URL."
+          if ($uri.Scheme -notin @("http", "https") -or -not $uri.Host.EndsWith(".ts.net")) {
+              throw "artifact_url must use a tailnet-only .ts.net host."
           }
           if ($env:EXPECTED_SHA256 -notmatch "^[A-Fa-f0-9]{64}$") {
               throw "expected_sha256 must contain exactly 64 hexadecimal characters."
