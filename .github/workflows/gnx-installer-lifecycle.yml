@@ -68,6 +68,7 @@ jobs:
               stage = "download"
               result = "failed"
               arpEntriesAfterInstall = @()
+              visibleArpEntriesAfterInstall = @()
               serviceRecovery = $null
               sentinelSha256 = $null
               error = $null
@@ -214,9 +215,28 @@ jobs:
                       systemComponent = $_.SystemComponent
                   }
               })
+              $visibleEntries = @($installEntries | Where-Object {
+                  [int]$_.SystemComponent -ne 1
+              })
+              $hiddenEntries = @($installEntries | Where-Object {
+                  [int]$_.SystemComponent -eq 1
+              })
+              $summary.visibleArpEntriesAfterInstall = @($visibleEntries | ForEach-Object {
+                  [ordered]@{
+                      registryView = $_.RegistryView
+                      registryKey = $_.RegistryKey
+                      displayName = $_.DisplayName
+                      displayVersion = $_.DisplayVersion
+                      publisher = $_.Publisher
+                  }
+              })
               Save-Summary
-              if ($installEntries.Count -ne 1) {
-                  throw "Expected one Quetzalcoatl Programs and Features entry; found $($installEntries.Count)."
+              if ($visibleEntries.Count -ne 1) {
+                  throw "Expected one visible Quetzalcoatl Programs and Features entry; found $($visibleEntries.Count)."
+              }
+              if ($hiddenEntries.Count -ne 1 -or
+                  $hiddenEntries[0].DisplayName -ne "Quetzalcoatl 0.3 Preview") {
+                  throw "Expected exactly one hidden internal MSI registration."
               }
 
               $cliPath = Join-Path $env:ProgramFiles "Quetzalcoatl\gnx.exe"
