@@ -198,6 +198,32 @@ jobs:
         run: |
           set -euo pipefail
 
+          cat > "${RUNNER_TEMP}/rdp_probe.py" <<'PY'
+          import socket
+
+          request = bytes.fromhex("030000130ee00000000000010008000b000000")
+          try:
+              with socket.create_connection(("127.0.0.1", 3389), timeout=2) as connection:
+                  connection.settimeout(2)
+                  connection.sendall(request)
+                  response = b""
+                  while len(response) < 11:
+                      chunk = connection.recv(64)
+                      if not chunk:
+                          break
+                      response += chunk
+          except OSError:
+              raise SystemExit(1)
+
+          if (
+              len(response) < 11
+              or response[:2] != b"\x03\x00"
+              or int.from_bytes(response[2:4], "big") < 11
+              or response[5] & 0xF0 != 0xD0
+          ):
+              raise SystemExit(1)
+          PY
+
           ready=false
           for attempt in $(seq 1 200); do
             state="$(docker inspect --format '{{.State.Status}}' gnx-windows 2>/dev/null || true)"
@@ -209,7 +235,7 @@ jobs:
               exit 1
             fi
 
-            if timeout 2 bash -c '</dev/tcp/127.0.0.1/3389' 2>/dev/null; then
+            if python3 "${RUNNER_TEMP}/rdp_probe.py"; then
               ready=true
               break
             fi
@@ -233,8 +259,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          tailscale serve --bg --tcp=3389 tcp://127.0.0.1:3389
-          tailscale serve status --json >/dev/null
+          sudo tailscale serve --bg --tcp=3389 tcp://127.0.0.1:3389
+          sudo tailscale serve status --json >/dev/null
 
           tailscale_ipv4="$(tailscale ip -4 | head -n 1)"
           dns_name="$(
@@ -288,6 +314,6 @@ jobs:
         shell: bash
         run: |
           set +e
-          tailscale serve reset
+          sudo tailscale serve reset
           docker stop --time 120 gnx-windows
           docker rm --force gnx-windows
