@@ -1,12 +1,12 @@
-name: Windows RDP via Tailscale
+name: Windows 11 GNX lab via Dockur
 
 on:
   workflow_dispatch:
     inputs:
       session_minutes:
-        description: "Duración de la sesión RDP"
+        description: Duración del host después de que RDP esté listo
         required: true
-        default: "330"
+        default: "240"
         type: choice
         options:
           - "60"
@@ -14,447 +14,280 @@ on:
           - "180"
           - "240"
           - "300"
-          - "330"
 
 concurrency:
-  group: windows-rdp-${{ github.repository }}
+  group: dockur-windows-${{ github.repository }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  windows-rdp:
-    name: Windows RDP
-    runs-on: windows-latest
+  dockur-windows:
+    name: Dockur Windows 11 GNX host
+    runs-on: ubuntu-24.04
     timeout-minutes: 355
-
     env:
-      RDP_USERNAME: ghrdp
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
       SESSION_MINUTES: ${{ inputs.session_minutes }}
+      RDP_USERNAME: gnxlab
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      DOCKUR_IMAGE: docker.io/dockurr/windows@sha256:8cc6f8bc4a60c078141fd3bcf7d2df69ae063a11d98be31a57429afe0dca66da
 
     steps:
       - name: Validate required secrets
-        shell: pwsh
+        shell: bash
         env:
-          TS_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          TS_CLIENT_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          TS_RDP_AUTH_KEY: ${{ secrets.TS_RDP_AUTH_KEY }}
         run: |
-          $ErrorActionPreference = "Stop"
+          set -euo pipefail
 
-          if ([string]::IsNullOrWhiteSpace($env:TS_CLIENT_ID)) {
-              throw "Missing GitHub secret: TS_OAUTH_CLIENT_ID"
+          [[ -n "${TS_RDP_AUTH_KEY}" ]] || {
+            echo "::error::Missing GitHub secret TS_RDP_AUTH_KEY."
+            exit 1
+          }
+          [[ ${#RDP_PASSWORD} -ge 12 && ${#RDP_PASSWORD} -le 127 ]] || {
+            echo "::error::RDP_PASSWORD must contain 12 to 127 characters."
+            exit 1
+          }
+          [[ "${SESSION_MINUTES}" =~ ^(60|120|180|240|300)$ ]] || {
+            echo "::error::Unsupported session duration."
+            exit 1
           }
 
-          if ([string]::IsNullOrWhiteSpace($env:TS_CLIENT_SECRET)) {
-              throw "Missing GitHub secret: TS_OAUTH_SECRET"
+      - name: Reclaim ephemeral runner storage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          paths=(
+            /usr/local/lib/android
+            /usr/share/dotnet
+            /opt/ghc
+            /usr/local/.ghcup
+            /opt/hostedtoolcache/CodeQL
+          )
+          for path in "${paths[@]}"; do
+            if [[ -e "${path}" ]]; then
+              sudo rm -rf -- "${path}"
+            fi
+          done
+
+          sudo apt-get clean
+          docker system prune --all --force --volumes
+          df -h /
+
+      - name: Gate KVM, nested virtualization, memory, and disk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -c /dev/kvm ]] || {
+            echo "::error::The runner does not expose /dev/kvm."
+            exit 1
+          }
+          [[ -c /dev/net/tun ]] || {
+            echo "::error::The runner does not expose /dev/net/tun."
+            exit 1
           }
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-              throw "Missing GitHub secret: RDP_PASSWORD"
+          sudo chmod 0666 /dev/kvm
+
+          python3 - <<'PY'
+          import fcntl
+          import os
+
+          descriptor = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+          try:
+              api_version = fcntl.ioctl(descriptor, 0xAE00, 0)
+          finally:
+              os.close(descriptor)
+          if api_version != 12:
+              raise SystemExit(f"KVM API version is {api_version}, expected 12")
+          print("KVM_API_VERSION=12")
+          PY
+
+          grep -Eqm1 '(^|[[:space:]])(vmx|svm)($|[[:space:]])' /proc/cpuinfo || {
+            echo "::error::The runner CPU does not expose VMX or SVM."
+            exit 1
           }
 
-          if ($env:RDP_PASSWORD.Length -lt 12) {
-              throw "RDP_PASSWORD must contain at least 12 characters."
+          nested=""
+          parameters=(
+            /sys/module/kvm_intel/parameters/nested
+            /sys/module/kvm_amd/parameters/nested
+          )
+          for parameter in "${parameters[@]}"; do
+            if [[ -r "${parameter}" ]]; then
+              nested="$(tr -d '[:space:]' < "${parameter}")"
+              break
+            fi
+          done
+          [[ "${nested^^}" == "Y" || "${nested}" == "1" ]] || {
+            echo "::error::Nested KVM is not enabled on this runner."
+            exit 1
           }
 
-          if ($env:RDP_PASSWORD.Length -gt 127) {
-              throw "RDP_PASSWORD cannot exceed 127 characters."
+          memory_kib="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+          free_disk_gib="$(df -Pk / | awk 'NR == 2 { print int($4 / 1024 / 1024) }')"
+          cpu_count="$(nproc)"
+
+          (( memory_kib >= 15 * 1024 * 1024 )) || {
+            echo "::error::At least 15 GiB host RAM is required for the 12 GiB Windows guest."
+            exit 1
+          }
+          (( free_disk_gib >= 36 )) || {
+            echo "::error::At least 36 GiB free disk is required after runner cleanup; found ${free_disk_gib} GiB."
+            exit 1
           }
 
-          Write-Host "Required secrets are configured."
+          {
+            echo "## Dockur host preflight"
+            echo
+            echo "- KVM API: 12"
+            echo "- Nested KVM: ${nested}"
+            echo "- Runner CPUs: ${cpu_count}; Windows vCPUs: 6 (overcommitted)"
+            echo "- Runner RAM: $((memory_kib / 1024 / 1024)) GiB; Windows RAM: 12 GiB"
+            echo "- Free disk after cleanup: ${free_disk_gib} GiB"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Connect runner to Tailscale
-        uses: tailscale/github-action@v4
+      - name: Connect the RDP edge to Tailscale
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          authkey: ${{ secrets.TS_RDP_AUTH_KEY }}
           tags: tag:github-rdp
-          hostname: github-rdp-${{ github.run_id }}
-          version: latest
+          hostname: github-dockur-${{ github.run_id }}
+          version: 1.98.8
           timeout: 3m
           retry: "5"
           use-cache: "true"
-          log-mode: normal
 
-      - name: Configure Windows RDP
-        id: configure-rdp
-        shell: pwsh
+      - name: Start the pinned Dockur Windows 11 guest
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
+          set -euo pipefail
 
-          $username = $env:RDP_USERNAME
-          $password = ConvertTo-SecureString `
-              -String $env:RDP_PASSWORD `
-              -AsPlainText `
-              -Force
+          storage="${RUNNER_TEMP}/gnx-windows"
+          mkdir -p "${storage}"
+          docker pull "${DOCKUR_IMAGE}"
 
-          Write-Host "Creating or updating local RDP account..."
+          docker_args=(
+            --detach
+            --name gnx-windows
+            --device /dev/kvm
+            --device /dev/net/tun
+            --cap-add NET_ADMIN
+            --env VERSION=11
+            --env CPU_CORES=6
+            --env RAM_SIZE=12G
+            --env DISK_SIZE=100G
+            --env VMX=Y
+            --env LANGUAGE=English
+            --env REGION=en-US
+            --env KEYBOARD=en-US
+            --env "USERNAME=${RDP_USERNAME}"
+            --env PASSWORD
+            --publish 127.0.0.1:3389:3389/tcp
+            --publish 127.0.0.1:8006:8006/tcp
+            --volume "${storage}:/storage"
+            --stop-timeout 120
+          )
+          docker run "${docker_args[@]}" "${DOCKUR_IMAGE}"
 
-          $existingUser = Get-LocalUser `
-              -Name $username `
-              -ErrorAction SilentlyContinue
-
-          if ($null -eq $existingUser) {
-              New-LocalUser `
-                  -Name $username `
-                  -Password $password `
-                  -Description "Temporary GitHub RDP account" `
-                  -PasswordNeverExpires `
-                  -AccountNeverExpires
-          }
-          else {
-              Set-LocalUser `
-                  -Name $username `
-                  -Password $password `
-                  -Description "Temporary GitHub RDP account" `
-                  -PasswordNeverExpires $true `
-                  -AccountNeverExpires
-          }
-
-          Enable-LocalUser -Name $username
-
-          $administratorsGroup = (
-              New-Object System.Security.Principal.SecurityIdentifier(
-                  "S-1-5-32-544"
-              )
-          ).Translate(
-              [System.Security.Principal.NTAccount]
-          ).Value.Split('\')[-1]
-
-          $remoteDesktopGroup = (
-              New-Object System.Security.Principal.SecurityIdentifier(
-                  "S-1-5-32-555"
-              )
-          ).Translate(
-              [System.Security.Principal.NTAccount]
-          ).Value.Split('\')[-1]
-
-          Add-LocalGroupMember `
-              -Group $administratorsGroup `
-              -Member $username `
-              -ErrorAction SilentlyContinue
-
-          Add-LocalGroupMember `
-              -Group $remoteDesktopGroup `
-              -Member $username `
-              -ErrorAction SilentlyContinue
-
-          Write-Host "Enabling Remote Desktop..."
-
-          $terminalServerPath = `
-              "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
-
-          $rdpTcpPath = `
-              "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
-
-          Set-ItemProperty `
-              -Path $terminalServerPath `
-              -Name "fDenyTSConnections" `
-              -Type DWord `
-              -Value 0
-
-          Set-ItemProperty `
-              -Path $rdpTcpPath `
-              -Name "fEnableWinStation" `
-              -Type DWord `
-              -Value 1
-
-          Set-ItemProperty `
-              -Path $rdpTcpPath `
-              -Name "UserAuthentication" `
-              -Type DWord `
-              -Value 1
-
-          Set-ItemProperty `
-              -Path $rdpTcpPath `
-              -Name "SecurityLayer" `
-              -Type DWord `
-              -Value 2
-
-          Set-ItemProperty `
-              -Path $rdpTcpPath `
-              -Name "MinEncryptionLevel" `
-              -Type DWord `
-              -Value 3
-
-          Set-Service `
-              -Name "TermService" `
-              -StartupType Automatic
-
-          Set-Service `
-              -Name "UmRdpService" `
-              -StartupType Manual `
-              -ErrorAction SilentlyContinue
-
-          Write-Host "Creating Tailscale-only firewall rules..."
-
-          Get-NetFirewallRule `
-              -DisplayName "GitHub RDP via Tailscale*" `
-              -ErrorAction SilentlyContinue |
-              Remove-NetFirewallRule `
-                  -ErrorAction SilentlyContinue
-
-          New-NetFirewallRule `
-              -DisplayName "GitHub RDP via Tailscale TCP" `
-              -Description "Allow RDP TCP only through Tailscale" `
-              -Direction Inbound `
-              -Action Allow `
-              -Enabled True `
-              -Profile Any `
-              -Protocol TCP `
-              -LocalPort 3389 `
-              -RemoteAddress "100.64.0.0/10" |
-              Out-Null
-
-          New-NetFirewallRule `
-              -DisplayName "GitHub RDP via Tailscale UDP" `
-              -Description "Allow RDP UDP only through Tailscale" `
-              -Direction Inbound `
-              -Action Allow `
-              -Enabled True `
-              -Profile Any `
-              -Protocol UDP `
-              -LocalPort 3389 `
-              -RemoteAddress "100.64.0.0/10" |
-              Out-Null
-
-          New-NetFirewallRule `
-              -DisplayName "GitHub RDP via Tailscale IPv6 TCP" `
-              -Description "Allow RDP TCP through Tailscale IPv6" `
-              -Direction Inbound `
-              -Action Allow `
-              -Enabled True `
-              -Profile Any `
-              -Protocol TCP `
-              -LocalPort 3389 `
-              -RemoteAddress "fd7a:115c:a1e0::/48" |
-              Out-Null
-
-          New-NetFirewallRule `
-              -DisplayName "GitHub RDP via Tailscale IPv6 UDP" `
-              -Description "Allow RDP UDP through Tailscale IPv6" `
-              -Direction Inbound `
-              -Action Allow `
-              -Enabled True `
-              -Profile Any `
-              -Protocol UDP `
-              -LocalPort 3389 `
-              -RemoteAddress "fd7a:115c:a1e0::/48" |
-              Out-Null
-
-          Write-Host "Restarting Remote Desktop Services..."
-
-          $termService = Get-Service `
-              -Name "TermService" `
-              -ErrorAction Stop
-
-          if ($termService.Status -eq "Running") {
-              Restart-Service `
-                  -Name "TermService" `
-                  -Force `
-                  -ErrorAction Stop
-          }
-          else {
-              Start-Service `
-                  -Name "TermService" `
-                  -ErrorAction Stop
-          }
-
-          Start-Sleep -Seconds 3
-
-          Start-Service `
-              -Name "UmRdpService" `
-              -ErrorAction SilentlyContinue
-
-          $service = Get-Service -Name "TermService"
-
-          if ($service.Status -ne "Running") {
-              throw "Remote Desktop Services did not start correctly."
-          }
-
-          $rdpListening = $null
-
-          for ($attempt = 1; $attempt -le 6; $attempt++) {
-              $rdpListening = Get-NetTCPConnection `
-                  -LocalPort 3389 `
-                  -State Listen `
-                  -ErrorAction SilentlyContinue
-
-              if ($null -ne $rdpListening) {
-                  break
-              }
-
-              Write-Host "Waiting for RDP listener, attempt $attempt/6..."
-              Start-Sleep -Seconds 5
-          }
-
-          if ($null -eq $rdpListening) {
-              Write-Host "RDP session information:"
-              qwinsta.exe
-
-              throw "RDP is not listening on TCP port 3389."
-          }
-
-          Write-Host "RDP configuration completed."
-
-      - name: Publish connection details
-        shell: pwsh
+      - name: Wait for the Windows RDP listener
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
+          set -euo pipefail
 
-          $tailscaleIPv4 = @(
-              tailscale.exe ip -4
-          ) | Select-Object -First 1
+          ready=false
+          for attempt in $(seq 1 200); do
+            state="$(docker inspect --format '{{.State.Status}}' gnx-windows 2>/dev/null || true)"
+            if [[ "${state}" != "running" ]]; then
+              echo "::error::Dockur exited before Windows became ready."
+              docker logs gnx-windows 2>&1 |
+                grep -Ei 'error|fail|fatal|kvm|space|memory' |
+                tail -n 80 || true
+              exit 1
+            fi
 
-          $tailscaleIPv6 = @(
-              tailscale.exe ip -6
-          ) | Select-Object -First 1
+            if timeout 2 bash -c '</dev/tcp/127.0.0.1/3389' 2>/dev/null; then
+              ready=true
+              break
+            fi
 
-          if (-not [string]::IsNullOrWhiteSpace($tailscaleIPv4)) {
-              $tailscaleIPv4 = $tailscaleIPv4.Trim()
+            if (( attempt % 20 == 0 )); then
+              echo "Waiting for Windows RDP: attempt ${attempt}/200"
+            fi
+            sleep 15
+          done
+
+          [[ "${ready}" == "true" ]] || {
+            echo "::error::Windows did not expose RDP within 50 minutes."
+            docker logs gnx-windows 2>&1 |
+              grep -Ei 'error|fail|fatal|kvm|space|memory' |
+              tail -n 80 || true
+            exit 1
           }
 
-          if (-not [string]::IsNullOrWhiteSpace($tailscaleIPv6)) {
-              $tailscaleIPv6 = $tailscaleIPv6.Trim()
-          }
-
-          $tailscaleStatus = tailscale.exe status --json |
-              ConvertFrom-Json
-
-          $dnsName = [string]$tailscaleStatus.Self.DNSName
-
-          if (-not [string]::IsNullOrWhiteSpace($dnsName)) {
-              $dnsName = $dnsName.TrimEnd(".")
-          }
-          else {
-              $dnsName = "MagicDNS unavailable"
-          }
-
-          if ([string]::IsNullOrWhiteSpace($tailscaleIPv4)) {
-              throw "Could not determine the Tailscale IPv4 address."
-          }
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host " WINDOWS RDP READY"
-          Write-Host "=============================================="
-          Write-Host "IPv4:     $tailscaleIPv4"
-          Write-Host "IPv6:     $tailscaleIPv6"
-          Write-Host "Hostname: $dnsName"
-          Write-Host "Username: $env:RDP_USERNAME"
-          Write-Host "Port:     3389"
-          Write-Host "=============================================="
-          Write-Host ""
-
-          @"
-          # Windows RDP ready
-
-          | Setting | Value |
-          |---|---|
-          | Tailscale IPv4 | ``$tailscaleIPv4`` |
-          | Tailscale IPv6 | ``$tailscaleIPv6`` |
-          | MagicDNS | ``$dnsName`` |
-          | Username | ``$env:RDP_USERNAME`` |
-          | Port | ``3389`` |
-          | Session duration | ``$env:SESSION_MINUTES minutes`` |
-
-          ## Connect from Windows
-
-          Press **Win + R** and execute:
-
-          ``````
-          mstsc.exe
-          ``````
-
-          Use the Tailscale IPv4 or MagicDNS hostname shown above.
-
-          The password is stored in the GitHub secret ``RDP_PASSWORD``.
-          "@ | Out-File `
-              -FilePath $env:GITHUB_STEP_SUMMARY `
-              -Encoding utf8 `
-              -Append
-
-      - name: Keep RDP session alive
-        shell: pwsh
+      - name: Publish RDP only inside the tailnet
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
+          set -euo pipefail
 
-          $minutes = 0
+          tailscale serve --bg --tcp=3389 tcp://127.0.0.1:3389
+          tailscale serve status --json >/dev/null
 
-          if (-not [int]::TryParse(
-              $env:SESSION_MINUTES,
-              [ref]$minutes
-          )) {
-              throw "Invalid session duration."
+          tailscale_ipv4="$(tailscale ip -4 | head -n 1)"
+          dns_name="$(
+            tailscale status --json |
+              python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"].get("DNSName", "").rstrip("."))'
+          )"
+
+          [[ -n "${tailscale_ipv4}" ]] || {
+            echo "::error::Tailscale did not expose an IPv4 address."
+            exit 1
           }
 
-          if ($minutes -lt 1 -or $minutes -gt 330) {
-              throw "Session duration must be between 1 and 330 minutes."
-          }
+          {
+            echo
+            echo "## Windows 11 GNX candidate ready"
+            echo
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Tailscale IPv4 | ${tailscale_ipv4} |"
+            echo "| MagicDNS | ${dns_name:-unavailable} |"
+            echo "| Username | ${RDP_USERNAME} |"
+            echo "| Port | 3389 |"
+            echo "| Session after readiness | ${SESSION_MINUTES} minutes |"
+            echo
+            echo "RDP terminates in the Dockur Windows guest. Run the unchanged Quetzalcoatl installer there; HostPreflight remains the authority for WSL2 and nested KVM."
+          } >> "${GITHUB_STEP_SUMMARY}"
 
-          $finishAt = (Get-Date).AddMinutes($minutes)
+      - name: Keep the candidate host alive
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          Write-Host "RDP runner will remain active until approximately:"
-          Write-Host $finishAt.ToString("yyyy-MM-dd HH:mm:ss K")
-          Write-Host ""
-          Write-Host "Cancel the workflow manually when finished."
+          finish_at=$(($(date +%s) + SESSION_MINUTES * 60))
+          while (( $(date +%s) < finish_at )); do
+            state="$(docker inspect --format '{{.State.Status}}' gnx-windows 2>/dev/null || true)"
+            [[ "${state}" == "running" ]] || {
+              echo "::error::Dockur stopped before the requested session ended."
+              exit 1
+            }
 
-          while ((Get-Date) -lt $finishAt) {
-              $remaining = [math]::Ceiling(
-                  ($finishAt - (Get-Date)).TotalMinutes
-              )
+            if timeout 2 bash -c '</dev/tcp/127.0.0.1/3389' 2>/dev/null; then
+              echo "[$(date --iso-8601=seconds)] Dockur is running; RDP is listening."
+            else
+              echo "[$(date --iso-8601=seconds)] Dockur is running; Windows is rebooting or RDP is temporarily unavailable."
+            fi
+            sleep 60
+          done
 
-              $tailscaleIP = @(
-                  tailscale.exe ip -4
-              ) | Select-Object -First 1
-
-              $termService = Get-Service -Name "TermService"
-
-              if ($termService.Status -ne "Running") {
-                  Write-Warning "TermService stopped. Starting it again..."
-
-                  Start-Service `
-                      -Name "TermService" `
-                      -ErrorAction Stop
-
-                  Start-Service `
-                      -Name "UmRdpService" `
-                      -ErrorAction SilentlyContinue
-              }
-
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP active at $tailscaleIP - $remaining minute(s) remaining."
-
-              Start-Sleep -Seconds 60
-          }
-
-          Write-Host "Requested RDP session duration completed."
-
-      - name: Cleanup RDP configuration
+      - name: Cleanup the ephemeral host
         if: always()
-        shell: pwsh
+        shell: bash
         run: |
-          $ErrorActionPreference = "Continue"
-
-          Write-Host "Removing temporary firewall rules..."
-
-          Get-NetFirewallRule `
-              -DisplayName "GitHub RDP via Tailscale*" `
-              -ErrorAction SilentlyContinue |
-              Remove-NetFirewallRule `
-                  -ErrorAction SilentlyContinue
-
-          Write-Host "Removing temporary local account..."
-
-          $existingUser = Get-LocalUser `
-              -Name $env:RDP_USERNAME `
-              -ErrorAction SilentlyContinue
-
-          if ($null -ne $existingUser) {
-              Remove-LocalUser `
-                  -Name $env:RDP_USERNAME `
-                  -ErrorAction SilentlyContinue
-          }
-
-          Write-Host "Cleanup completed."
+          set +e
+          tailscale serve reset
+          docker stop --time 120 gnx-windows
+          docker rm --force gnx-windows
