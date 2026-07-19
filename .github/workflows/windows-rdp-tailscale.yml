@@ -3,6 +3,14 @@ name: Windows 11 GNX lab via Dockur
 on:
   workflow_dispatch:
     inputs:
+      host_slot:
+        description: Slot estable del host candidato
+        required: true
+        default: "node-2"
+        type: choice
+        options:
+          - "node-2"
+          - "node-3"
       session_minutes:
         description: Duración del host después de que RDP esté listo
         required: true
@@ -16,7 +24,7 @@ on:
           - "300"
 
 concurrency:
-  group: dockur-windows-${{ github.repository }}
+  group: dockur-windows-${{ github.repository }}-${{ inputs.host_slot }}
   cancel-in-progress: false
 
 permissions:
@@ -28,6 +36,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
+      HOST_SLOT: ${{ inputs.host_slot }}
       SESSION_MINUTES: ${{ inputs.session_minutes }}
       RDP_USERNAME: gnxlab
       RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -51,6 +60,10 @@ jobs:
           }
           [[ "${SESSION_MINUTES}" =~ ^(60|120|180|240|300)$ ]] || {
             echo "::error::Unsupported session duration."
+            exit 1
+          }
+          [[ "${HOST_SLOT}" =~ ^node-(2|3)$ ]] || {
+            echo "::error::Unsupported Dockur host slot."
             exit 1
           }
 
@@ -155,7 +168,7 @@ jobs:
         with:
           authkey: ${{ secrets.TS_RDP_AUTH_KEY }}
           tags: tag:github-rdp
-          hostname: github-dockur-${{ github.run_id }}
+          hostname: github-dockur-${{ inputs.host_slot }}-${{ github.run_id }}
           version: 1.98.8
           timeout: 3m
           retry: "5"
@@ -279,6 +292,7 @@ jobs:
             echo
             echo "| Setting | Value |"
             echo "|---|---|"
+            echo "| Host slot | ${HOST_SLOT} |"
             echo "| Tailscale IPv4 | ${tailscale_ipv4} |"
             echo "| MagicDNS | ${dns_name:-unavailable} |"
             echo "| Username | ${RDP_USERNAME} |"
