@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Draft release tag containing the frozen GNX setup asset
+        description: Test prerelease tag containing the frozen GNX setup asset
         required: true
         type: string
       expected_sha256:
@@ -23,12 +23,6 @@ on:
         default: "120"
         type: choice
         options: ["60", "120", "180"]
-      enable_loopback_rdp:
-        description: Optional tailnet-only RDP alongside noVNC
-        required: true
-        default: false
-        type: boolean
-
 permissions:
   contents: read
 
@@ -47,14 +41,12 @@ jobs:
       EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
       SLOT: ${{ inputs.slot }}
       SESSION_MINUTES: ${{ inputs.session_minutes }}
-      ENABLE_LOOPBACK_RDP: ${{ inputs.enable_loopback_rdp }}
 
     steps:
       - name: Validate inputs and access secrets
         shell: bash
         env:
           TS_RDP_AUTH_KEY: ${{ secrets.TS_RDP_AUTH_KEY }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || { echo '::error::Invalid release_tag.'; exit 1; }
@@ -62,9 +54,6 @@ jobs:
           [[ "$SLOT" =~ ^(controller|member-1|member-2)$ ]] || { echo '::error::Invalid logical slot.'; exit 1; }
           [[ "$SESSION_MINUTES" =~ ^(60|120|180)$ ]] || { echo '::error::Invalid session duration.'; exit 1; }
           [[ -n "$TS_RDP_AUTH_KEY" ]] || { echo '::error::Missing TS_RDP_AUTH_KEY for authenticated noVNC.'; exit 1; }
-          if [[ "$ENABLE_LOOPBACK_RDP" == true ]]; then
-            [[ ${#RDP_PASSWORD} -ge 12 && ${#RDP_PASSWORD} -le 127 ]] || { echo '::error::RDP_PASSWORD must be 12 to 127 characters when RDP is enabled.'; exit 1; }
-          fi
 
       - name: Reclaim ephemeral runner storage
         shell: bash
@@ -209,14 +198,12 @@ jobs:
 
       - name: Start the pinned Dockur Windows guest
         shell: bash
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           set -euo pipefail
           storage="$RUNNER_TEMP/gnx-windows-storage"
           shared="$RUNNER_TEMP/gnx-shared"
           mkdir -p "$storage" "$shared"
-          if [[ "$ENABLE_LOOPBACK_RDP" == true ]]; then password="$RDP_PASSWORD"; else password="$(openssl rand -hex 32)"; fi
+          password="$(openssl rand -hex 32)"
           export PASSWORD="$password"
           docker pull "$DOCKUR_IMAGE"
           docker_args=(
@@ -227,9 +214,6 @@ jobs:
             --volume "$storage:/storage" --volume "$RUNNER_TEMP/oem:/oem:ro" --volume "$shared:/shared"
             --stop-timeout 120
           )
-          if [[ "$ENABLE_LOOPBACK_RDP" == true ]]; then
-            docker_args+=(--publish 127.0.0.1:3389:3389/tcp)
-          fi
           docker run "${docker_args[@]}" "$DOCKUR_IMAGE"
           unset PASSWORD password
 
@@ -247,14 +231,14 @@ jobs:
           done
           [[ "$ready" == true ]] || { echo '::error::Dockur web viewer did not become ready within 50 minutes.'; exit 1; }
 
-      - name: Publish authenticated HTTPS noVNC and optional loopback RDP
+      - name: Publish tailnet-authenticated noVNC
         shell: bash
         run: |
           set -euo pipefail
           sudo tailscale serve --bg --https=443 http://127.0.0.1:8006
-          if [[ "$ENABLE_LOOPBACK_RDP" == true ]]; then
-            sudo tailscale serve --bg --tcp=3389 tcp://127.0.0.1:3389
-          fi
+          # Port 3389 reuses the existing tag:github-rdp ACL, but forwards the
+          # Dockur web viewer rather than the guest RDP listener.
+          sudo tailscale serve --bg --tcp=3389 tcp://127.0.0.1:8006
           sudo tailscale serve status --json > "$RUNNER_TEMP/tailscale-serve.json"
           dns_name="$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"].get("DNSName", "").rstrip("."))')"
           [[ -n "$dns_name" ]] || { echo '::error::Tailscale did not provide a DNS name.'; exit 1; }
@@ -263,11 +247,12 @@ jobs:
             echo '## Interactive Windows session ready'
             echo
             echo "- Logical slot: ${SLOT} (a separate ephemeral compatibility session; not quorum or Corosync proof)"
-            echo "- Authenticated noVNC: https://${dns_name}/"
+            echo "- Preferred noVNC endpoint: https://${dns_name}/"
+            echo "- Existing-ACL noVNC endpoint: http://${dns_name}:3389/ (HTTP at the application layer; authenticated and encrypted by Tailscale at the network layer, not HTTPS)"
             echo "- Session duration after viewer readiness: ${SESSION_MINUTES} minutes"
             echo '- In Windows, open `C:\OEM`, run `01-Install-GNX.cmd`, allow real reboots, run `02-Configure-GNX.cmd`, then run `03-Collect-GNX-Evidence.cmd`.'
             echo '- Web viewer availability is not GNX acceptance. Acceptance requires genuine `gnx status --json` evidence in `Z:\gnx-evidence`.'
-            echo '- No Funnel is configured. No password or auth key is printed.'
+            echo '- Both endpoints remain tailnet-only; no Funnel, RDP listener, password, or auth key is exposed.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep the interactive session bounded
