@@ -140,8 +140,72 @@ jobs:
           Start-Process -FilePath $installer -ArgumentList '/uninstall' -Verb RunAs -Wait
           PS
           cat > "$oem/Collect-GnxEvidence.ps1" <<'PS'
+          param([switch]$SelfTest)
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
+          function Test-ExactPropertyNames($Object, [string[]]$Expected) {
+            if ($null -eq $Object -or $Object -isnot [pscustomobject]) { return $false }
+            $actual = @($Object.PSObject.Properties | ForEach-Object { $_.Name })
+            return $actual.Count -eq $Expected.Count -and @($Expected | Where-Object { $_ -notin $actual }).Count -eq 0
+          }
+          function ConvertTo-SafeGnxStatus($Status) {
+            if ($null -eq $Status -or $Status -isnot [pscustomobject]) { throw 'Unexpected GNX status schema.' }
+            $statusKeys = @('schema_version', 'overall', 'stage', 'role', 'controller', 'components', 'cluster', 'services')
+            $allowedStatusKeys = $statusKeys + 'last_error'
+            $actualStatusKeys = @($Status.PSObject.Properties | ForEach-Object { $_.Name })
+            $hasOnlyAllowedStatusKeys = @($actualStatusKeys | Where-Object { $_ -notin $allowedStatusKeys }).Count -eq 0
+            $hasAllStatusKeys = @($statusKeys | Where-Object { $_ -notin $actualStatusKeys }).Count -eq 0
+            if (-not $hasOnlyAllowedStatusKeys -or -not $hasAllStatusKeys -or
+                ($Status.schema_version -isnot [int] -and $Status.schema_version -isnot [long]) -or $Status.schema_version -ne 1 -or
+                $Status.overall -isnot [string] -or [string]::IsNullOrWhiteSpace($Status.overall) -or
+                $Status.stage -isnot [string] -or [string]::IsNullOrWhiteSpace($Status.stage) -or
+                ($null -ne $Status.role -and $Status.role -isnot [string]) -or
+                ($null -ne $Status.controller -and $Status.controller -isnot [string]) -or
+                -not (Test-ExactPropertyNames $Status.components @('service', 'wsl', 'podman_machine', 'kvm', 'tailscale', 'tailscale_serve', 'proxmox', 'opentofu')) -or
+                -not (Test-ExactPropertyNames $Status.cluster @('joined', 'quorate')) -or
+                -not (Test-ExactPropertyNames $Status.services @('garage', 'forgejo')) -or
+                -not (@($Status.components.service, $Status.components.wsl, $Status.components.podman_machine, $Status.components.kvm, $Status.components.tailscale, $Status.components.tailscale_serve, $Status.components.proxmox, $Status.components.opentofu | Where-Object { $_ -isnot [string] }).Count -eq 0) -or
+                $Status.cluster.joined -isnot [bool] -or $Status.cluster.quorate -isnot [bool] -or
+                -not (@($Status.services.garage, $Status.services.forgejo | Where-Object { $_ -isnot [string] }).Count -eq 0)) {
+              throw 'Unexpected GNX status schema.'
+            }
+            $safeStatus = [ordered]@{
+              schema_version = $Status.schema_version
+              overall = $Status.overall
+              stage = $Status.stage
+              role = $Status.role
+              controller = $Status.controller
+              components = [ordered]@{
+                service = $Status.components.service
+                wsl = $Status.components.wsl
+                podman_machine = $Status.components.podman_machine
+                kvm = $Status.components.kvm
+                tailscale = $Status.components.tailscale
+                tailscale_serve = $Status.components.tailscale_serve
+                proxmox = $Status.components.proxmox
+                opentofu = $Status.components.opentofu
+              }
+              cluster = [ordered]@{ joined = $Status.cluster.joined; quorate = $Status.cluster.quorate }
+              services = [ordered]@{ garage = $Status.services.garage; forgejo = $Status.services.forgejo }
+            }
+            $lastError = $Status.PSObject.Properties['last_error']
+            if ($null -ne $lastError -and $null -ne $lastError.Value) { $safeStatus.last_error = 'reported' }
+            return $safeStatus
+          }
+          if ($SelfTest) {
+            $base = [pscustomobject]@{
+              schema_version = 1; overall = 'ready'; stage = 'configured'; role = $null; controller = $null
+              components = [pscustomobject]@{ service='ok'; wsl='ok'; podman_machine='ok'; kvm='ok'; tailscale='ok'; tailscale_serve='ok'; proxmox='ok'; opentofu='ok' }
+              cluster = [pscustomobject]@{ joined=$false; quorate=$false }
+              services = [pscustomobject]@{ garage='ok'; forgejo='ok' }
+              last_error = $null
+            }
+            $withoutLastError = ConvertTo-SafeGnxStatus $base
+            if ($null -ne $withoutLastError.PSObject.Properties['last_error']) { throw 'Null last_error was not omitted.' }
+            $base.last_error = 'sensitive detail'
+            if ((ConvertTo-SafeGnxStatus $base).last_error -ne 'reported') { throw 'Non-null last_error was not transformed.' }
+            exit 0
+          }
           $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
           $sharedRoots = @('Z:\')
           if (-not [string]::IsNullOrWhiteSpace($desktop)) {
@@ -170,17 +234,28 @@ jobs:
           $installer = Join-Path $PSScriptRoot 'Quetzalcoatl-0.3.0-preview-setup-x64.exe'
           $report = [ordered]@{ schemaVersion = 1; collectedAtUtc = (Get-Date).ToUniversalTime().ToString('o'); installerSha256 = $null; services = @(); binaryHashes = @(); gnxStatusJson = $null; gnxStatusError = $null }
           if (Test-Path -LiteralPath $installer) { $report.installerSha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash }
-          $report.services = @(Get-CimInstance Win32_Service | Where-Object { $_.PathName -match '(?i)quetzalcoatl|gnx' -or $_.Name -match '(?i)quetzalcoatl|gnx' } | ForEach-Object { [ordered]@{ name=$_.Name; state=$_.State; startMode=$_.StartMode; startName=$_.StartName } })
+          $report.services = @(Get-CimInstance Win32_Service | Where-Object { $_.Name -ieq 'Quetzalcoatl' } | ForEach-Object { [ordered]@{ name=[string]$_.Name; state=[string]$_.State; startMode=[string]$_.StartMode; startName=[string]$_.StartName } })
           $roots = @((Join-Path $env:ProgramFiles 'Quetzalcoatl'), (Join-Path ${env:ProgramFiles(x86)} 'Quetzalcoatl')) | Where-Object { Test-Path -LiteralPath $_ }
           $binaries = @(foreach ($root in $roots) { Get-ChildItem -LiteralPath $root -Recurse -File -Include *.exe,*.dll })
           $report.binaryHashes = @($binaries | ForEach-Object { [ordered]@{ path=$_.FullName.Substring($env:ProgramFiles.Length); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } })
           $gnx = @($binaries | Where-Object { $_.Name -ieq 'gnx.exe' } | Select-Object -First 1)
           if ($gnx) {
-            try { $report.gnxStatusJson = (& $gnx.FullName status --json | Out-String).Trim(); if ($LASTEXITCODE -ne 0) { throw "gnx status --json exited $LASTEXITCODE" } }
-            catch { $report.gnxStatusError = $_.Exception.Message }
-          } else { $report.gnxStatusError = 'GNX is not installed; gnx status --json was not run.' }
+            $statusOutput = (& $gnx.FullName status --json 2>$null | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) {
+              $report.gnxStatusError = 'status-command-exited-nonzero-before-interactive-configuration'
+            } else {
+              try {
+                $status = $statusOutput | ConvertFrom-Json -ErrorAction Stop
+                $safeStatus = ConvertTo-SafeGnxStatus $status
+                $report.gnxStatusJson = $safeStatus | ConvertTo-Json -Depth 6 -Compress
+              } catch {
+                # Do not persist parser errors or command output.
+              }
+            }
+          }
           $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $out 'gnx-evidence.json') -Encoding utf8
           PS
+          pwsh -NoLogo -NoProfile -File "$oem/Collect-GnxEvidence.ps1" -SelfTest
           cat > "$oem/01-Install-GNX.cmd" <<'BAT'
           @echo off
           powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-GnxElevated.ps1"
@@ -262,7 +337,7 @@ jobs:
           # Port 3389 reuses the existing tag:github-rdp ACL, but forwards the
           # Dockur web viewer rather than the guest RDP listener.
           sudo tailscale serve --bg --tcp=3389 tcp://127.0.0.1:8006
-          sudo tailscale serve status --json > "$RUNNER_TEMP/tailscale-serve.json"
+          sudo tailscale serve status --json | tee "$RUNNER_TEMP/tailscale-serve.json" >/dev/null
           dns_name="$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"].get("DNSName", "").rstrip("."))')"
           [[ -n "$dns_name" ]] || { echo '::error::Tailscale did not provide a DNS name.'; exit 1; }
           {
@@ -273,23 +348,139 @@ jobs:
             echo "- Preferred noVNC endpoint: https://${dns_name}/"
             echo "- Existing-ACL noVNC endpoint: http://${dns_name}:3389/ (HTTP at the application layer; authenticated and encrypted by Tailscale at the network layer, not HTTPS)"
             echo "- Session duration after viewer readiness: ${SESSION_MINUTES} minutes"
+            # shellcheck disable=SC2016 # Backticks are literal documentation, not command substitutions.
             echo '- In Windows, open `C:\OEM`, run `01-Install-GNX.cmd`, allow real reboots, run `02-Configure-GNX.cmd`, then run `03-Collect-GNX-Evidence.cmd`.'
-            echo '- Web viewer availability is not GNX acceptance. Acceptance requires genuine `gnx status --json` evidence in Dockur shared folder (`Z:\gnx-evidence` when available, otherwise `Desktop\Shared\gnx-evidence`).'
+            # shellcheck disable=SC2016 # Backticks are literal documentation, not command substitutions.
+            echo '- The run succeeds early only after the host validates exported guest evidence: the expected installer hash, a detected GNX service, a `gnx.exe` hash, and either schema-valid `gnx status --json` output or the collector fixed nonzero-before-interactive-configuration category.'
+            echo '- This hosted evidence rule is not G5 physical quorum, Corosync, direct-path, or cluster-network proof.'
             echo '- Both endpoints remain tailnet-only; no Funnel, RDP listener, password, or auth key is exposed.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep the interactive session bounded
+      - name: Wait for valid exported guest evidence within the bounded interactive session
         shell: bash
         run: |
           set -euo pipefail
+          evidence_path="$RUNNER_TEMP/gnx-shared/gnx-evidence/gnx-evidence.json"
+          validator="$RUNNER_TEMP/validate-gnx-evidence.py"
+          cat > "$validator" <<'PY'
+          #!/usr/bin/env python3
+          """Validate the fixed, allowlisted GNX guest-evidence envelope."""
+          import copy
+          import json
+          import sys
+          from pathlib import Path
+
+          FIXED_STATUS_ERROR = 'status-command-exited-nonzero-before-interactive-configuration'
+          TOP_LEVEL_KEYS = {'schemaVersion', 'collectedAtUtc', 'installerSha256', 'services', 'binaryHashes', 'gnxStatusJson', 'gnxStatusError'}
+          SERVICE_KEYS = {'name', 'state', 'startMode', 'startName'}
+          BINARY_KEYS = {'path', 'sha256'}
+
+          def is_sha256(value):
+              return isinstance(value, str) and len(value) == 64 and all(character in '0123456789abcdefABCDEF' for character in value)
+
+          def has_exact_keys(value, expected):
+              return isinstance(value, dict) and set(value) == expected
+
+          def is_gnx_status(status):
+              required = {'schema_version', 'overall', 'stage', 'role', 'controller', 'components', 'cluster', 'services'}
+              allowed = required | {'last_error'}
+              if not isinstance(status, dict) or set(status) - allowed or not required <= set(status):
+                  return False
+              if not isinstance(status['schema_version'], int) or isinstance(status['schema_version'], bool) or status['schema_version'] != 1:
+                  return False
+              if not all(isinstance(status[field], str) and status[field].strip() for field in ('overall', 'stage')):
+                  return False
+              if not all(status[field] is None or isinstance(status[field], str) for field in ('role', 'controller')):
+                  return False
+              if 'last_error' in status and status['last_error'] != 'reported':
+                  return False
+              component_keys = {'service', 'wsl', 'podman_machine', 'kvm', 'tailscale', 'tailscale_serve', 'proxmox', 'opentofu'}
+              if not has_exact_keys(status['components'], component_keys) or not all(isinstance(value, str) for value in status['components'].values()):
+                  return False
+              if not has_exact_keys(status['cluster'], {'joined', 'quorate'}) or not all(isinstance(value, bool) for value in status['cluster'].values()):
+                  return False
+              return has_exact_keys(status['services'], {'garage', 'forgejo'}) and all(isinstance(value, str) for value in status['services'].values())
+
+          def validate_report(report, expected_sha256):
+              if not has_exact_keys(report, TOP_LEVEL_KEYS): return 'evidence envelope keys are invalid'
+              if not isinstance(report['schemaVersion'], int) or isinstance(report['schemaVersion'], bool) or report['schemaVersion'] != 1: return 'evidence schema version is invalid'
+              if not isinstance(report['collectedAtUtc'], str) or not report['collectedAtUtc'].strip(): return 'evidence collection time is invalid'
+              if not is_sha256(report['installerSha256']) or report['installerSha256'].lower() != expected_sha256.lower(): return 'installer hash is missing or mismatched'
+              services = report['services']
+              if not isinstance(services, list) or len(services) != 1: return 'service evidence must contain exactly one service'
+              service = services[0]
+              if not has_exact_keys(service, SERVICE_KEYS) or not all(isinstance(value, str) for value in service.values()): return 'service evidence has invalid keys or types'
+              if service['name'].casefold() != 'quetzalcoatl' or service['startName'].casefold() != r'nt service\quetzalcoatl': return 'service identity is invalid'
+              binary_hashes = report['binaryHashes']
+              if not isinstance(binary_hashes, list): return 'binary hashes are invalid'
+              has_gnx_binary = False
+              for binary in binary_hashes:
+                  if not has_exact_keys(binary, BINARY_KEYS) or not all(isinstance(value, str) for value in binary.values()): return 'binary hash evidence has invalid keys or types'
+                  if not is_sha256(binary['sha256']): return 'binary hash is invalid'
+                  if binary['path'].replace('\\', '/').rsplit('/', 1)[-1].casefold() == 'gnx.exe': has_gnx_binary = True
+              if not has_gnx_binary: return 'no installed gnx.exe hash'
+              status_json = report['gnxStatusJson']
+              status_error = report['gnxStatusError']
+              if status_json is None:
+                  return None if status_error == FIXED_STATUS_ERROR else 'gnx status output is missing or has an unsafe error category'
+              if not isinstance(status_json, str) or not status_json.strip() or status_error is not None: return 'gnx status JSON and error combination is invalid'
+              try: status = json.loads(status_json)
+              except json.JSONDecodeError: return 'gnx status JSON is invalid'
+              return None if is_gnx_status(status) else 'gnx status JSON has an invalid schema'
+
+          def valid_status(last_error_marker=False):
+              status = {'schema_version': 1, 'overall': 'ready', 'stage': 'configured', 'role': None, 'controller': None, 'components': {key: 'ok' for key in ('service', 'wsl', 'podman_machine', 'kvm', 'tailscale', 'tailscale_serve', 'proxmox', 'opentofu')}, 'cluster': {'joined': False, 'quorate': False}, 'services': {'garage': 'ok', 'forgejo': 'ok'}}
+              if last_error_marker: status['last_error'] = 'reported'
+              return status
+
+          def valid_report(expected_sha256, status=True):
+              return {'schemaVersion': 1, 'collectedAtUtc': '2026-01-01T00:00:00.0000000Z', 'installerSha256': expected_sha256, 'services': [{'name': 'Quetzalcoatl', 'state': 'Running', 'startMode': 'Auto', 'startName': r'NT SERVICE\Quetzalcoatl'}], 'binaryHashes': [{'path': r'\Quetzalcoatl\gnx.exe', 'sha256': expected_sha256}], 'gnxStatusJson': json.dumps(valid_status(last_error_marker=True)) if status else None, 'gnxStatusError': None if status else FIXED_STATUS_ERROR}
+
+          def self_test():
+              expected = 'a' * 64
+              fixtures = [('valid status', valid_report(expected), True), ('valid fixed category', valid_report(expected, status=False), True)]
+              report = valid_report(expected); report['unexpected'] = True; fixtures.append(('extra top-level key', report, False))
+              report = valid_report(expected); report['services'][0]['extra'] = 'x'; fixtures.append(('extra service key', report, False))
+              report = valid_report(expected); report['services'][0]['state'] = 1; fixtures.append(('wrong service type', report, False))
+              report = valid_report(expected); report['binaryHashes'][0]['extra'] = 'x'; fixtures.append(('extra binary key', report, False))
+              report = valid_report(expected); report['binaryHashes'][0]['sha256'] = 1; fixtures.append(('wrong binary type', report, False))
+              report = valid_report(expected); report['services'][0]['name'] = 'fake-quetzalcoatl'; fixtures.append(('substring service name', report, False))
+              report = valid_report(expected); report['services'][0]['startName'] = 'LocalSystem'; fixtures.append(('wrong service account', report, False))
+              report = valid_report(expected); report['services'].append(copy.deepcopy(report['services'][0])); fixtures.append(('multiple services', report, False))
+              report = valid_report(expected); report['gnxStatusError'] = FIXED_STATUS_ERROR; fixtures.append(('status and error together', report, False))
+              for name, report, should_pass in fixtures:
+                  accepted = validate_report(report, expected) is None
+                  if accepted != should_pass: raise AssertionError(f'fixture failed: {name}')
+                  if not should_pass and accepted: raise AssertionError(f'invalid fixture could be copied: {name}')
+              assert 'last_error' not in valid_status()
+              assert valid_status(last_error_marker=True)['last_error'] == 'reported'
+
+          def main(argv):
+              if argv == ['--self-test']:
+                  self_test()
+                  return 0
+              if len(argv) != 2: return 1
+              try: report = json.loads(Path(argv[0]).read_text(encoding='utf-8-sig'))
+              except (OSError, UnicodeError, json.JSONDecodeError): return 1
+              return 0 if validate_report(report, argv[1]) is None else 1
+
+          if __name__ == '__main__': raise SystemExit(main(sys.argv[1:]))
+          PY
+          python3 "$validator" --self-test
           finish_at=$(( $(date +%s) + SESSION_MINUTES * 60 ))
           while (( $(date +%s) < finish_at )); do
             [[ "$(docker inspect --format '{{.State.Status}}' gnx-dockur 2>/dev/null || true)" == running ]] || { echo '::error::Dockur stopped before the bounded session ended.'; exit 1; }
-            echo "[$(date --iso-8601=seconds)] Dockur container remains running; guest reboots may temporarily interrupt noVNC."
+            if python3 "$validator" "$evidence_path" "$EXPECTED_SHA256" >/dev/null 2>&1; then
+              echo 'Validated exported GNX guest evidence; ending the interactive session early.'
+              exit 0
+            fi
+            echo "[$(date --iso-8601=seconds)] Waiting for valid exported GNX evidence; guest reboots may temporarily interrupt noVNC."
             sleep 60
           done
+          echo '::error::Interactive session expired without valid exported GNX evidence.'
+          exit 1
 
-      - name: Collect bounded host diagnostics and redacted guest evidence
+      - name: Collect allowlisted host and guest evidence
         if: always()
         shell: bash
         run: |
@@ -301,8 +492,13 @@ jobs:
             > "$evidence/dockur-inspect.json" || true
           df -h / > "$evidence/host-disk.txt"
           cp "$RUNNER_TEMP/tailscale-serve.json" "$evidence/tailscale-serve.json" 2>/dev/null || true
-          cp "$RUNNER_TEMP/gnx-shared/gnx-evidence/gnx-evidence.json" "$evidence/gnx-evidence.json" 2>/dev/null || true
-          find "$evidence" -type f -print0 | xargs -0r sed -Ei 's/(password|auth.?key|credential)[[:space:]]*[:=][[:space:]]*[^,[:space:]]+/\1=[REDACTED]/Ig'
+          validator="$RUNNER_TEMP/validate-gnx-evidence.py"
+          source_evidence="$RUNNER_TEMP/gnx-shared/gnx-evidence/gnx-evidence.json"
+          if [[ -f "$validator" ]] && python3 "$validator" "$source_evidence" "$EXPECTED_SHA256" >/dev/null 2>&1; then
+            cp "$source_evidence" "$evidence/gnx-evidence.json"
+          else
+            printf '%s\n' 'gnx-evidence-missing-or-invalid' > "$evidence/gnx-evidence-invalid-or-missing.txt"
+          fi
 
       - name: Upload short-lived evidence
         if: always()
