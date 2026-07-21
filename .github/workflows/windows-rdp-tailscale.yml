@@ -1,333 +1,315 @@
-name: Windows 11 GNX lab via Dockur
+name: GNX Dockur interactive compatibility lab
 
 on:
   workflow_dispatch:
     inputs:
-      host_slot:
-        description: Slot estable del host candidato
+      release_tag:
+        description: Draft release tag containing the frozen GNX setup asset
         required: true
-        default: "node-2"
+        type: string
+      expected_sha256:
+        description: SHA-256 for Quetzalcoatl-0.3.0-preview-setup-x64.exe
+        required: true
+        type: string
+      slot:
+        description: Deterministic logical compatibility slot
+        required: true
+        default: controller
         type: choice
-        options:
-          - "node-2"
-          - "node-3"
+        options: [controller, member-1, member-2]
       session_minutes:
-        description: Duración del host después de que RDP esté listo
+        description: Bounded interactive noVNC session after the viewer is ready
         required: true
-        default: "240"
+        default: "120"
         type: choice
-        options:
-          - "60"
-          - "120"
-          - "180"
-          - "240"
-          - "300"
-
-concurrency:
-  group: dockur-windows-${{ github.repository }}-${{ inputs.host_slot }}
-  cancel-in-progress: false
+        options: ["60", "120", "180"]
+      enable_loopback_rdp:
+        description: Optional tailnet-only RDP alongside noVNC
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
+concurrency:
+  group: gnx-dockur-${{ github.repository }}-${{ inputs.slot }}
+  cancel-in-progress: false
+
 jobs:
-  dockur-windows:
-    name: Dockur Windows 11 GNX host
+  dockur-compatibility:
+    name: Dockur ${{ inputs.slot }} interactive compatibility
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
-      HOST_SLOT: ${{ inputs.host_slot }}
-      SESSION_MINUTES: ${{ inputs.session_minutes }}
-      RDP_USERNAME: gnxlab
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
       DOCKUR_IMAGE: docker.io/dockurr/windows@sha256:8cc6f8bc4a60c078141fd3bcf7d2df69ae063a11d98be31a57429afe0dca66da
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+      SLOT: ${{ inputs.slot }}
+      SESSION_MINUTES: ${{ inputs.session_minutes }}
+      ENABLE_LOOPBACK_RDP: ${{ inputs.enable_loopback_rdp }}
 
     steps:
-      - name: Validate required secrets
+      - name: Validate inputs and access secrets
         shell: bash
         env:
           TS_RDP_AUTH_KEY: ${{ secrets.TS_RDP_AUTH_KEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           set -euo pipefail
-
-          [[ -n "${TS_RDP_AUTH_KEY}" ]] || {
-            echo "::error::Missing GitHub secret TS_RDP_AUTH_KEY."
-            exit 1
-          }
-          [[ ${#RDP_PASSWORD} -ge 12 && ${#RDP_PASSWORD} -le 127 ]] || {
-            echo "::error::RDP_PASSWORD must contain 12 to 127 characters."
-            exit 1
-          }
-          [[ "${SESSION_MINUTES}" =~ ^(60|120|180|240|300)$ ]] || {
-            echo "::error::Unsupported session duration."
-            exit 1
-          }
-          [[ "${HOST_SLOT}" =~ ^node-(2|3)$ ]] || {
-            echo "::error::Unsupported Dockur host slot."
-            exit 1
-          }
+          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || { echo '::error::Invalid release_tag.'; exit 1; }
+          [[ "$EXPECTED_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]] || { echo '::error::expected_sha256 must be 64 hexadecimal characters.'; exit 1; }
+          [[ "$SLOT" =~ ^(controller|member-1|member-2)$ ]] || { echo '::error::Invalid logical slot.'; exit 1; }
+          [[ "$SESSION_MINUTES" =~ ^(60|120|180)$ ]] || { echo '::error::Invalid session duration.'; exit 1; }
+          [[ -n "$TS_RDP_AUTH_KEY" ]] || { echo '::error::Missing TS_RDP_AUTH_KEY for authenticated noVNC.'; exit 1; }
+          if [[ "$ENABLE_LOOPBACK_RDP" == true ]]; then
+            [[ ${#RDP_PASSWORD} -ge 12 && ${#RDP_PASSWORD} -le 127 ]] || { echo '::error::RDP_PASSWORD must be 12 to 127 characters when RDP is enabled.'; exit 1; }
+          fi
 
       - name: Reclaim ephemeral runner storage
         shell: bash
         run: |
           set -euo pipefail
-
-          paths=(
-            /usr/local/lib/android
-            /usr/share/dotnet
-            /opt/ghc
-            /usr/local/.ghcup
-            /opt/hostedtoolcache/CodeQL
-          )
-          for path in "${paths[@]}"; do
-            if [[ -e "${path}" ]]; then
-              sudo rm -rf -- "${path}"
-            fi
+          for path in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; do
+            [[ -e "$path" ]] && sudo rm -rf -- "$path"
           done
-
           sudo apt-get clean
           docker system prune --all --force --volumes
           df -h /
 
-      - name: Gate KVM, nested virtualization, memory, and disk
+      - name: Gate KVM API 12, nested virtualization, TUN, memory, and disk
         shell: bash
         run: |
           set -euo pipefail
-
-          [[ -c /dev/kvm ]] || {
-            echo "::error::The runner does not expose /dev/kvm."
-            exit 1
-          }
-          [[ -c /dev/net/tun ]] || {
-            echo "::error::The runner does not expose /dev/net/tun."
-            exit 1
-          }
-
+          [[ -c /dev/kvm ]] || { echo '::error::The runner does not expose /dev/kvm.'; exit 1; }
+          [[ -c /dev/net/tun ]] || { echo '::error::The runner does not expose /dev/net/tun.'; exit 1; }
           sudo chmod 0666 /dev/kvm
-
           python3 - <<'PY'
           import fcntl
           import os
-
-          descriptor = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+          fd = os.open('/dev/kvm', os.O_RDWR | os.O_CLOEXEC)
           try:
-              api_version = fcntl.ioctl(descriptor, 0xAE00, 0)
+              api = fcntl.ioctl(fd, 0xAE00, 0)
           finally:
-              os.close(descriptor)
-          if api_version != 12:
-              raise SystemExit(f"KVM API version is {api_version}, expected 12")
-          print("KVM_API_VERSION=12")
+              os.close(fd)
+          if api != 12:
+              raise SystemExit(f'KVM API version is {api}, expected 12')
+          print('KVM_API_VERSION=12')
           PY
-
-          grep -Eqm1 '(^|[[:space:]])(vmx|svm)($|[[:space:]])' /proc/cpuinfo || {
-            echo "::error::The runner CPU does not expose VMX or SVM."
-            exit 1
-          }
-
-          nested=""
-          parameters=(
-            /sys/module/kvm_intel/parameters/nested
-            /sys/module/kvm_amd/parameters/nested
-          )
-          for parameter in "${parameters[@]}"; do
-            if [[ -r "${parameter}" ]]; then
-              nested="$(tr -d '[:space:]' < "${parameter}")"
-              break
-            fi
+          grep -Eqm1 '(^|[[:space:]])(vmx|svm)($|[[:space:]])' /proc/cpuinfo || { echo '::error::VMX/SVM is unavailable.'; exit 1; }
+          nested=''
+          for parameter in /sys/module/kvm_intel/parameters/nested /sys/module/kvm_amd/parameters/nested; do
+            if [[ -r "$parameter" ]]; then nested="$(tr -d '[:space:]' < "$parameter")"; break; fi
           done
-          [[ "${nested^^}" == "Y" || "${nested}" == "1" ]] || {
-            echo "::error::Nested KVM is not enabled on this runner."
-            exit 1
-          }
-
-          memory_kib="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
-          free_disk_gib="$(df -Pk / | awk 'NR == 2 { print int($4 / 1024 / 1024) }')"
-          cpu_count="$(nproc)"
-
-          (( memory_kib >= 15 * 1024 * 1024 )) || {
-            echo "::error::At least 15 GiB host RAM is required for the 12 GiB Windows guest."
-            exit 1
-          }
-          (( free_disk_gib >= 36 )) || {
-            echo "::error::At least 36 GiB free disk is required after runner cleanup; found ${free_disk_gib} GiB."
-            exit 1
-          }
-
+          [[ "${nested^^}" == Y || "$nested" == 1 ]] || { echo '::error::Nested KVM is not enabled.'; exit 1; }
+          memory_kib="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+          free_disk_gib="$(df -Pk / | awk 'NR == 2 {print int($4 / 1024 / 1024)}')"
+          (( memory_kib >= 15 * 1024 * 1024 )) || { echo '::error::Need at least 15 GiB host RAM.'; exit 1; }
+          (( free_disk_gib >= 36 )) || { echo "::error::Need 36 GiB free disk; found ${free_disk_gib} GiB."; exit 1; }
           {
-            echo "## Dockur host preflight"
+            echo '## Dockur compatibility preflight'
             echo
-            echo "- KVM API: 12"
-            echo "- Nested KVM: ${nested}"
-            echo "- Runner CPUs: ${cpu_count}; Windows vCPUs: 6 (overcommitted)"
-            echo "- Runner RAM: $((memory_kib / 1024 / 1024)) GiB; Windows RAM: 12 GiB"
-            echo "- Free disk after cleanup: ${free_disk_gib} GiB"
-          } >> "${GITHUB_STEP_SUMMARY}"
+            echo "- Logical slot: ${SLOT}"
+            echo "- KVM API: 12; nested KVM: ${nested}; TUN: available"
+            echo "- Host RAM: $((memory_kib / 1024 / 1024)) GiB; free disk: ${free_disk_gib} GiB"
+            echo '- Evidence class: hosted interactive compatibility session, not physical-lab cluster acceptance.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Connect the RDP edge to Tailscale
+      - name: Download and verify frozen installer on the Linux host
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/oem"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern 'Quetzalcoatl-0.3.0-preview-setup-x64.exe' --dir "$RUNNER_TEMP/oem"
+          installer="$RUNNER_TEMP/oem/Quetzalcoatl-0.3.0-preview-setup-x64.exe"
+          actual="$(sha256sum "$installer" | awk '{print $1}')"
+          [[ "${actual,,}" == "${EXPECTED_SHA256,,}" ]] || { echo '::error::Frozen installer SHA-256 mismatch.'; exit 1; }
+
+      - name: Create user-invoked guest helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          oem="$RUNNER_TEMP/oem"
+          cat > "$oem/Install-GnxElevated.ps1" <<'PS'
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $PSScriptRoot 'Quetzalcoatl-0.3.0-preview-setup-x64.exe'
+          if (-not (Test-Path -LiteralPath $installer)) { throw "Frozen installer is missing: $installer" }
+          Start-Process -FilePath $installer -Verb RunAs -Wait
+          PS
+          cat > "$oem/Repair-GnxElevated.ps1" <<'PS'
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $PSScriptRoot 'Quetzalcoatl-0.3.0-preview-setup-x64.exe'
+          if (-not (Test-Path -LiteralPath $installer)) { throw "Frozen installer is missing: $installer" }
+          Start-Process -FilePath $installer -ArgumentList '/repair' -Verb RunAs -Wait
+          PS
+          cat > "$oem/Uninstall-GnxElevated.ps1" <<'PS'
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $PSScriptRoot 'Quetzalcoatl-0.3.0-preview-setup-x64.exe'
+          if (-not (Test-Path -LiteralPath $installer)) { throw "Frozen installer is missing: $installer" }
+          Start-Process -FilePath $installer -ArgumentList '/uninstall' -Verb RunAs -Wait
+          PS
+          cat > "$oem/Collect-GnxEvidence.ps1" <<'PS'
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $out = 'Z:\gnx-evidence'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $installer = Join-Path $PSScriptRoot 'Quetzalcoatl-0.3.0-preview-setup-x64.exe'
+          $report = [ordered]@{ schemaVersion = 1; collectedAtUtc = (Get-Date).ToUniversalTime().ToString('o'); installerSha256 = $null; services = @(); binaryHashes = @(); gnxStatusJson = $null; gnxStatusError = $null }
+          if (Test-Path -LiteralPath $installer) { $report.installerSha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash }
+          $report.services = @(Get-CimInstance Win32_Service | Where-Object { $_.PathName -match '(?i)quetzalcoatl|gnx' -or $_.Name -match '(?i)quetzalcoatl|gnx' } | ForEach-Object { [ordered]@{ name=$_.Name; state=$_.State; startMode=$_.StartMode; startName=$_.StartName } })
+          $roots = @((Join-Path $env:ProgramFiles 'Quetzalcoatl'), (Join-Path ${env:ProgramFiles(x86)} 'Quetzalcoatl')) | Where-Object { Test-Path -LiteralPath $_ }
+          $binaries = @(foreach ($root in $roots) { Get-ChildItem -LiteralPath $root -Recurse -File -Include *.exe,*.dll })
+          $report.binaryHashes = @($binaries | ForEach-Object { [ordered]@{ path=$_.FullName.Substring($env:ProgramFiles.Length); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } })
+          $gnx = @($binaries | Where-Object { $_.Name -ieq 'gnx.exe' } | Select-Object -First 1)
+          if ($gnx) {
+            try { $report.gnxStatusJson = (& $gnx.FullName status --json | Out-String).Trim(); if ($LASTEXITCODE -ne 0) { throw "gnx status --json exited $LASTEXITCODE" } }
+            catch { $report.gnxStatusError = $_.Exception.Message }
+          } else { $report.gnxStatusError = 'GNX is not installed; gnx status --json was not run.' }
+          $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $out 'gnx-evidence.json') -Encoding utf8
+          PS
+          cat > "$oem/01-Install-GNX.cmd" <<'BAT'
+          @echo off
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-GnxElevated.ps1"
+          pause
+          BAT
+          cat > "$oem/02-Configure-GNX.cmd" <<'BAT'
+          @echo off
+          "%ProgramFiles%\Quetzalcoatl\gnx.exe" configure
+          pause
+          BAT
+          cat > "$oem/03-Collect-GNX-Evidence.cmd" <<'BAT'
+          @echo off
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0Collect-GnxEvidence.ps1"
+          pause
+          BAT
+          cat > "$oem/90-Repair-GNX.cmd" <<'BAT'
+          @echo off
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0Repair-GnxElevated.ps1"
+          pause
+          BAT
+          cat > "$oem/99-Uninstall-GNX.cmd" <<'BAT'
+          @echo off
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0Uninstall-GnxElevated.ps1"
+          pause
+          BAT
+          test ! -e "$oem/install.bat"
+
+      - name: Connect noVNC edge to the tailnet
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
           authkey: ${{ secrets.TS_RDP_AUTH_KEY }}
           tags: tag:github-rdp
-          hostname: github-dockur-${{ inputs.host_slot }}-${{ github.run_id }}
+          hostname: github-dockur-${{ inputs.slot }}-${{ github.run_id }}
           version: 1.98.8
           timeout: 3m
-          retry: "5"
-          use-cache: "true"
+          retry: '5'
+          use-cache: 'true'
 
-      - name: Start the pinned Dockur Windows 11 guest
+      - name: Start the pinned Dockur Windows guest
         shell: bash
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           set -euo pipefail
-
-          storage="${RUNNER_TEMP}/gnx-windows"
-          mkdir -p "${storage}"
-          docker pull "${DOCKUR_IMAGE}"
-
+          storage="$RUNNER_TEMP/gnx-windows-storage"
+          shared="$RUNNER_TEMP/gnx-shared"
+          mkdir -p "$storage" "$shared"
+          if [[ "$ENABLE_LOOPBACK_RDP" == true ]]; then password="$RDP_PASSWORD"; else password="$(openssl rand -hex 32)"; fi
+          export PASSWORD="$password"
+          docker pull "$DOCKUR_IMAGE"
           docker_args=(
-            --detach
-            --name gnx-windows
-            --device /dev/kvm
-            --device /dev/net/tun
-            --cap-add NET_ADMIN
-            --env VERSION=11
-            --env CPU_CORES=6
-            --env RAM_SIZE=12G
-            --env DISK_SIZE=100G
-            --env VMX=Y
-            --env LANGUAGE=English
-            --env REGION=en-US
-            --env KEYBOARD=en-US
-            --env "USERNAME=${RDP_USERNAME}"
-            --env PASSWORD
-            --publish 127.0.0.1:3389:3389/tcp
+            --detach --name gnx-dockur --device /dev/kvm --device /dev/net/tun --cap-add NET_ADMIN
+            --env VERSION=11 --env CPU_CORES=6 --env RAM_SIZE=12G --env DISK_SIZE=100G --env VMX=Y
+            --env LANGUAGE=English --env REGION=en-US --env KEYBOARD=en-US --env USERNAME=gnxlab --env PASSWORD
             --publish 127.0.0.1:8006:8006/tcp
-            --volume "${storage}:/storage"
+            --volume "$storage:/storage" --volume "$RUNNER_TEMP/oem:/oem:ro" --volume "$shared:/shared"
             --stop-timeout 120
           )
-          docker run "${docker_args[@]}" "${DOCKUR_IMAGE}"
+          if [[ "$ENABLE_LOOPBACK_RDP" == true ]]; then
+            docker_args+=(--publish 127.0.0.1:3389:3389/tcp)
+          fi
+          docker run "${docker_args[@]}" "$DOCKUR_IMAGE"
+          unset PASSWORD password
 
-      - name: Wait for the Windows RDP listener
+      - name: Wait for the Dockur web viewer and container health
         shell: bash
         run: |
           set -euo pipefail
-
-          cat > "${RUNNER_TEMP}/rdp_probe.py" <<'PY'
-          import socket
-
-          request = bytes.fromhex("030000130ee00000000000010008000b000000")
-          try:
-              with socket.create_connection(("127.0.0.1", 3389), timeout=2) as connection:
-                  connection.settimeout(2)
-                  connection.sendall(request)
-                  response = b""
-                  while len(response) < 11:
-                      chunk = connection.recv(64)
-                      if not chunk:
-                          break
-                      response += chunk
-          except OSError:
-              raise SystemExit(1)
-
-          if (
-              len(response) < 11
-              or response[:2] != b"\x03\x00"
-              or int.from_bytes(response[2:4], "big") < 11
-              or response[5] & 0xF0 != 0xD0
-          ):
-              raise SystemExit(1)
-          PY
-
           ready=false
           for attempt in $(seq 1 200); do
-            state="$(docker inspect --format '{{.State.Status}}' gnx-windows 2>/dev/null || true)"
-            if [[ "${state}" != "running" ]]; then
-              echo "::error::Dockur exited before Windows became ready."
-              docker logs gnx-windows 2>&1 |
-                grep -Ei 'error|fail|fatal|kvm|space|memory' |
-                tail -n 80 || true
-              exit 1
-            fi
-
-            if python3 "${RUNNER_TEMP}/rdp_probe.py"; then
-              ready=true
-              break
-            fi
-
-            if (( attempt % 20 == 0 )); then
-              echo "Waiting for Windows RDP: attempt ${attempt}/200"
-            fi
+            state="$(docker inspect --format '{{.State.Status}}' gnx-dockur 2>/dev/null || true)"
+            [[ "$state" == running ]] || { echo '::error::Dockur exited before the web viewer became ready.'; exit 1; }
+            if curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8006/ >/dev/null; then ready=true; break; fi
+            (( attempt % 20 == 0 )) && echo "Waiting for Dockur web viewer: ${attempt}/200"
             sleep 15
           done
+          [[ "$ready" == true ]] || { echo '::error::Dockur web viewer did not become ready within 50 minutes.'; exit 1; }
 
-          [[ "${ready}" == "true" ]] || {
-            echo "::error::Windows did not expose RDP within 50 minutes."
-            docker logs gnx-windows 2>&1 |
-              grep -Ei 'error|fail|fatal|kvm|space|memory' |
-              tail -n 80 || true
-            exit 1
-          }
-
-      - name: Publish RDP only inside the tailnet
+      - name: Publish authenticated HTTPS noVNC and optional loopback RDP
         shell: bash
         run: |
           set -euo pipefail
-
-          sudo tailscale serve --bg --tcp=3389 tcp://127.0.0.1:3389
-          sudo tailscale serve status --json >/dev/null
-
-          tailscale_ipv4="$(tailscale ip -4 | head -n 1)"
-          dns_name="$(
-            tailscale status --json |
-              python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"].get("DNSName", "").rstrip("."))'
-          )"
-
-          [[ -n "${tailscale_ipv4}" ]] || {
-            echo "::error::Tailscale did not expose an IPv4 address."
-            exit 1
-          }
-
+          sudo tailscale serve --bg --https=443 http://127.0.0.1:8006
+          if [[ "$ENABLE_LOOPBACK_RDP" == true ]]; then
+            sudo tailscale serve --bg --tcp=3389 tcp://127.0.0.1:3389
+          fi
+          sudo tailscale serve status --json > "$RUNNER_TEMP/tailscale-serve.json"
+          dns_name="$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"].get("DNSName", "").rstrip("."))')"
+          [[ -n "$dns_name" ]] || { echo '::error::Tailscale did not provide a DNS name.'; exit 1; }
           {
             echo
-            echo "## Windows 11 GNX candidate ready"
+            echo '## Interactive Windows session ready'
             echo
-            echo "| Setting | Value |"
-            echo "|---|---|"
-            echo "| Host slot | ${HOST_SLOT} |"
-            echo "| Tailscale IPv4 | ${tailscale_ipv4} |"
-            echo "| MagicDNS | ${dns_name:-unavailable} |"
-            echo "| Username | ${RDP_USERNAME} |"
-            echo "| Port | 3389 |"
-            echo "| Session after readiness | ${SESSION_MINUTES} minutes |"
-            echo
-            echo "RDP terminates in the Dockur Windows guest. Run the unchanged Quetzalcoatl installer there; HostPreflight remains the authority for WSL2 and nested KVM."
-          } >> "${GITHUB_STEP_SUMMARY}"
+            echo "- Logical slot: ${SLOT} (a separate ephemeral compatibility session; not quorum or Corosync proof)"
+            echo "- Authenticated noVNC: https://${dns_name}/"
+            echo "- Session duration after viewer readiness: ${SESSION_MINUTES} minutes"
+            echo '- In Windows, open `C:\OEM`, run `01-Install-GNX.cmd`, allow real reboots, run `02-Configure-GNX.cmd`, then run `03-Collect-GNX-Evidence.cmd`.'
+            echo '- Web viewer availability is not GNX acceptance. Acceptance requires genuine `gnx status --json` evidence in `Z:\gnx-evidence`.'
+            echo '- No Funnel is configured. No password or auth key is printed.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep the candidate host alive
+      - name: Keep the interactive session bounded
         shell: bash
         run: |
           set -euo pipefail
-
-          finish_at=$(($(date +%s) + SESSION_MINUTES * 60))
+          finish_at=$(( $(date +%s) + SESSION_MINUTES * 60 ))
           while (( $(date +%s) < finish_at )); do
-            state="$(docker inspect --format '{{.State.Status}}' gnx-windows 2>/dev/null || true)"
-            [[ "${state}" == "running" ]] || {
-              echo "::error::Dockur stopped before the requested session ended."
-              exit 1
-            }
-
-            if timeout 2 bash -c '</dev/tcp/127.0.0.1/3389' 2>/dev/null; then
-              echo "[$(date --iso-8601=seconds)] Dockur is running; RDP is listening."
-            else
-              echo "[$(date --iso-8601=seconds)] Dockur is running; Windows is rebooting or RDP is temporarily unavailable."
-            fi
+            [[ "$(docker inspect --format '{{.State.Status}}' gnx-dockur 2>/dev/null || true)" == running ]] || { echo '::error::Dockur stopped before the bounded session ended.'; exit 1; }
+            echo "[$(date --iso-8601=seconds)] Dockur container remains running; guest reboots may temporarily interrupt noVNC."
             sleep 60
           done
 
-      - name: Cleanup the ephemeral host
+      - name: Collect bounded host diagnostics and redacted guest evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/redacted-evidence"
+          mkdir -p "$evidence"
+          docker inspect gnx-dockur 2>/dev/null |
+            jq 'map({Id, Image, Created, State, HostConfig: {Memory: .HostConfig.Memory, NanoCpus: .HostConfig.NanoCpus, Devices: .HostConfig.Devices, PortBindings: .HostConfig.PortBindings}, Mounts: [.Mounts[] | {Type, Destination, RW}]})' \
+            > "$evidence/dockur-inspect.json" || true
+          df -h / > "$evidence/host-disk.txt"
+          cp "$RUNNER_TEMP/tailscale-serve.json" "$evidence/tailscale-serve.json" 2>/dev/null || true
+          cp "$RUNNER_TEMP/gnx-shared/gnx-evidence/gnx-evidence.json" "$evidence/gnx-evidence.json" 2>/dev/null || true
+          find "$evidence" -type f -print0 | xargs -0r sed -Ei 's/(password|auth.?key|credential)[[:space:]]*[:=][[:space:]]*[^,[:space:]]+/\1=[REDACTED]/Ig'
+
+      - name: Upload short-lived evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnx-dockur-${{ inputs.slot }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/redacted-evidence
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Cleanup the ephemeral guest and tailnet Serve endpoint
         if: always()
         shell: bash
         run: |
           set +e
           sudo tailscale serve reset
-          docker stop --time 120 gnx-windows
-          docker rm --force gnx-windows
+          docker stop --time 120 gnx-dockur
+          docker rm --force gnx-dockur
