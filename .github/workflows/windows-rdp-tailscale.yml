@@ -142,8 +142,31 @@ jobs:
           cat > "$oem/Collect-GnxEvidence.ps1" <<'PS'
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          $out = 'Z:\gnx-evidence'
-          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
+          $sharedRoots = @('Z:\')
+          if (-not [string]::IsNullOrWhiteSpace($desktop)) {
+            $sharedRoots += Join-Path $desktop 'Shared'
+          }
+          $out = $null
+          foreach ($sharedRoot in $sharedRoots) {
+            if (-not (Test-Path -LiteralPath $sharedRoot -PathType Container)) { continue }
+            $probe = $null
+            try {
+              $candidate = Join-Path $sharedRoot 'gnx-evidence'
+              New-Item -ItemType Directory -Force -Path $candidate | Out-Null
+              $probe = Join-Path $candidate ('.gnx-write-probe-{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+              Set-Content -LiteralPath $probe -Value 'probe' -NoNewline -Encoding ascii
+              Remove-Item -LiteralPath $probe -Force
+              $out = $candidate
+              break
+            } catch {
+              if ($null -ne $probe) { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+              # Try the next documented Dockur shared-root location.
+            }
+          }
+          if ($null -eq $out) {
+            throw 'No supported writable Dockur shared root was found (checked Z:\ and the current user Desktop\Shared folder); evidence was not written.'
+          }
           $installer = Join-Path $PSScriptRoot 'Quetzalcoatl-0.3.0-preview-setup-x64.exe'
           $report = [ordered]@{ schemaVersion = 1; collectedAtUtc = (Get-Date).ToUniversalTime().ToString('o'); installerSha256 = $null; services = @(); binaryHashes = @(); gnxStatusJson = $null; gnxStatusError = $null }
           if (Test-Path -LiteralPath $installer) { $report.installerSha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash }
@@ -251,7 +274,7 @@ jobs:
             echo "- Existing-ACL noVNC endpoint: http://${dns_name}:3389/ (HTTP at the application layer; authenticated and encrypted by Tailscale at the network layer, not HTTPS)"
             echo "- Session duration after viewer readiness: ${SESSION_MINUTES} minutes"
             echo '- In Windows, open `C:\OEM`, run `01-Install-GNX.cmd`, allow real reboots, run `02-Configure-GNX.cmd`, then run `03-Collect-GNX-Evidence.cmd`.'
-            echo '- Web viewer availability is not GNX acceptance. Acceptance requires genuine `gnx status --json` evidence in `Z:\gnx-evidence`.'
+            echo '- Web viewer availability is not GNX acceptance. Acceptance requires genuine `gnx status --json` evidence in Dockur shared folder (`Z:\gnx-evidence` when available, otherwise `Desktop\Shared\gnx-evidence`).'
             echo '- Both endpoints remain tailnet-only; no Funnel, RDP listener, password, or auth key is exposed.'
           } >> "$GITHUB_STEP_SUMMARY"
 
