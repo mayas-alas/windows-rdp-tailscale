@@ -23,6 +23,12 @@ on:
         default: "120"
         type: choice
         options: ["60", "120", "180"]
+      hyperv_mode:
+        description: QEMU Hyper-V enlightenments exposed to the Windows guest
+        required: true
+        default: passthrough
+        type: choice
+        options: [passthrough, disabled]
 permissions:
   contents: read
 
@@ -41,6 +47,7 @@ jobs:
       EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
       SLOT: ${{ inputs.slot }}
       SESSION_MINUTES: ${{ inputs.session_minutes }}
+      HYPERV_MODE: ${{ inputs.hyperv_mode }}
 
     steps:
       - name: Validate inputs and access secrets
@@ -53,6 +60,7 @@ jobs:
           [[ "$EXPECTED_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]] || { echo '::error::expected_sha256 must be 64 hexadecimal characters.'; exit 1; }
           [[ "$SLOT" =~ ^(controller|member-1|member-2)$ ]] || { echo '::error::Invalid logical slot.'; exit 1; }
           [[ "$SESSION_MINUTES" =~ ^(60|120|180)$ ]] || { echo '::error::Invalid session duration.'; exit 1; }
+          [[ "$HYPERV_MODE" =~ ^(passthrough|disabled)$ ]] || { echo '::error::Invalid Hyper-V mode.'; exit 1; }
           [[ -n "$TS_RDP_AUTH_KEY" ]] || { echo '::error::Missing TS_RDP_AUTH_KEY for authenticated noVNC.'; exit 1; }
 
       - name: Reclaim ephemeral runner storage
@@ -91,6 +99,21 @@ jobs:
             if [[ -r "$parameter" ]]; then nested="$(tr -d '[:space:]' < "$parameter")"; break; fi
           done
           [[ "${nested^^}" == Y || "$nested" == 1 ]] || { echo '::error::Nested KVM is not enabled.'; exit 1; }
+          capabilities="$RUNNER_TEMP/kvm-capabilities.txt"
+          {
+            echo "kernel=$(uname -r)"
+            grep -m1 '^model name' /proc/cpuinfo || true
+            grep -m1 -E '^(vmx|svm) flags' /proc/cpuinfo || true
+            for parameter in \
+              /sys/module/kvm_intel/parameters/nested \
+              /sys/module/kvm_intel/parameters/ept \
+              /sys/module/kvm_intel/parameters/enable_shadow_vmcs \
+              /sys/module/kvm_intel/parameters/enable_evmcs \
+              /sys/module/kvm_intel/parameters/enable_apicv \
+              /sys/module/kvm_amd/parameters/nested; do
+              [[ -r "$parameter" ]] && printf '%s=%s\n' "$(basename "$parameter")" "$(tr -d '[:space:]' < "$parameter")"
+            done
+          } > "$capabilities"
           memory_kib="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
           free_disk_gib="$(df -Pk / | awk 'NR == 2 {print int($4 / 1024 / 1024)}')"
           (( memory_kib >= 15 * 1024 * 1024 )) || { echo '::error::Need at least 15 GiB host RAM.'; exit 1; }
@@ -100,6 +123,7 @@ jobs:
             echo
             echo "- Logical slot: ${SLOT}"
             echo "- KVM API: 12; nested KVM: ${nested}; TUN: available"
+            echo "- QEMU Hyper-V mode: ${HYPERV_MODE}; VMX exposure: enabled"
             echo "- Host RAM: $((memory_kib / 1024 / 1024)) GiB; free disk: ${free_disk_gib} GiB"
             echo '- Evidence class: hosted interactive compatibility session, not physical-lab cluster acceptance.'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -303,10 +327,13 @@ jobs:
           mkdir -p "$storage" "$shared"
           password="$(openssl rand -hex 32)"
           export PASSWORD="$password"
+          hv='Y'
+          [[ "$HYPERV_MODE" == disabled ]] && hv='N'
           docker pull "$DOCKUR_IMAGE"
           docker_args=(
             --detach --name gnx-dockur --device /dev/kvm --device /dev/net/tun --cap-add NET_ADMIN
-            --env VERSION=11 --env CPU_CORES=6 --env RAM_SIZE=12G --env DISK_SIZE=100G --env VMX=Y
+            --env VERSION=11 --env CPU_CORES=6 --env RAM_SIZE=12G --env DISK_SIZE=100G
+            --env VMX=Y --env "HV=$hv" --env DEBUG=Y
             --env LANGUAGE=English --env REGION=en-US --env KEYBOARD=en-US --env USERNAME=gnxlab --env PASSWORD
             --publish 127.0.0.1:8006:8006/tcp
             --volume "$storage:/storage" --volume "$RUNNER_TEMP/oem:/oem:ro" --volume "$shared:/shared"
@@ -491,6 +518,7 @@ jobs:
             jq 'map({Id, Image, Created, State, HostConfig: {Memory: .HostConfig.Memory, NanoCpus: .HostConfig.NanoCpus, Devices: .HostConfig.Devices, PortBindings: .HostConfig.PortBindings}, Mounts: [.Mounts[] | {Type, Destination, RW}]})' \
             > "$evidence/dockur-inspect.json" || true
           df -h / > "$evidence/host-disk.txt"
+          cp "$RUNNER_TEMP/kvm-capabilities.txt" "$evidence/kvm-capabilities.txt" 2>/dev/null || true
           cp "$RUNNER_TEMP/tailscale-serve.json" "$evidence/tailscale-serve.json" 2>/dev/null || true
           validator="$RUNNER_TEMP/validate-gnx-evidence.py"
           source_evidence="$RUNNER_TEMP/gnx-shared/gnx-evidence/gnx-evidence.json"
