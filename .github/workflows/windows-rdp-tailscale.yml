@@ -29,6 +29,12 @@ on:
         default: explicit-nested
         type: choice
         options: [explicit-nested, passthrough, disabled]
+      runner_image:
+        description: GitHub-hosted Linux image used for the Dockur VM
+        required: true
+        default: ubuntu-22.04
+        type: choice
+        options: [ubuntu-22.04, ubuntu-24.04]
 permissions:
   contents: read
 
@@ -39,7 +45,7 @@ concurrency:
 jobs:
   dockur-compatibility:
     name: Dockur ${{ inputs.slot }} interactive compatibility
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runner_image }}
     timeout-minutes: 355
     env:
       DOCKUR_IMAGE: docker.io/dockurr/windows@sha256:8cc6f8bc4a60c078141fd3bcf7d2df69ae063a11d98be31a57429afe0dca66da
@@ -48,6 +54,7 @@ jobs:
       SLOT: ${{ inputs.slot }}
       SESSION_MINUTES: ${{ inputs.session_minutes }}
       HYPERV_MODE: ${{ inputs.hyperv_mode }}
+      RUNNER_IMAGE: ${{ inputs.runner_image }}
 
     steps:
       - name: Validate inputs and access secrets
@@ -61,6 +68,7 @@ jobs:
           [[ "$SLOT" =~ ^(controller|member-1|member-2)$ ]] || { echo '::error::Invalid logical slot.'; exit 1; }
           [[ "$SESSION_MINUTES" =~ ^(60|120|180)$ ]] || { echo '::error::Invalid session duration.'; exit 1; }
           [[ "$HYPERV_MODE" =~ ^(explicit-nested|passthrough|disabled)$ ]] || { echo '::error::Invalid Hyper-V mode.'; exit 1; }
+          [[ "$RUNNER_IMAGE" =~ ^ubuntu-(22\.04|24\.04)$ ]] || { echo '::error::Invalid runner image.'; exit 1; }
           [[ -n "$TS_RDP_AUTH_KEY" ]] || { echo '::error::Missing TS_RDP_AUTH_KEY for authenticated noVNC.'; exit 1; }
 
       - name: Reclaim ephemeral runner storage
@@ -125,6 +133,7 @@ jobs:
             echo '## Dockur compatibility preflight'
             echo
             echo "- Logical slot: ${SLOT}"
+            echo "- Runner image: ${RUNNER_IMAGE}"
             echo "- KVM API: 12; nested KVM: ${nested}; TUN: available"
             echo "- QEMU Hyper-V mode: ${HYPERV_MODE}; VMX exposure: enabled"
             echo "- Host RAM: $((memory_kib / 1024 / 1024)) GiB; free disk: ${free_disk_gib} GiB"
@@ -332,6 +341,7 @@ jobs:
           export PASSWORD="$password"
           hv='Y'
           cpu_flags=''
+          cpu_model=''
           case "$HYPERV_MODE" in
             disabled)
               hv='N'
@@ -342,13 +352,23 @@ jobs:
               # Hyper-V. Keep the production-safe set explicit and exclude
               # hv-passthrough, hv-crash, hv-reset, and Intel-only hv-evmcs.
               cpu_flags='hv-relaxed,hv-vapic,hv-spinlocks=0xfff,hv-vpindex,hv-runtime,hv-time,hv-synic,hv-stimer,hv-stimer-direct,hv-tlbflush,hv-ipi,hv-frequencies'
+              if grep -qm1 'vendor_id.*GenuineIntel' /proc/cpuinfo; then
+                # Recent Intel server models can boot-loop Windows 11 with
+                # nested Hyper-V. Cascade Lake is the newest model confirmed
+                # working by the upstream QEMU reproducer.
+                cpu_model='Cascadelake-Server-noTSX'
+                cpu_flags="+vmx,${cpu_flags},hv-evmcs"
+              else
+                echo '::error::The hosted runner is AMD. QEMU issue #3177 prevents Hyper-V/WSL from re-exposing SVM/NPT to the GNX Podman VM.'
+                exit 1
+              fi
               ;;
           esac
           docker pull "$DOCKUR_IMAGE"
           docker_args=(
             --detach --name gnx-dockur --device /dev/kvm --device /dev/net/tun --cap-add NET_ADMIN
             --env VERSION=11 --env CPU_CORES=6 --env RAM_SIZE=12G --env DISK_SIZE=100G
-            --env VMX=Y --env "HV=$hv" --env "CPU_FLAGS=$cpu_flags" --env DEBUG=Y
+            --env VMX=Y --env "HV=$hv" --env "CPU_MODEL=$cpu_model" --env "CPU_FLAGS=$cpu_flags" --env DEBUG=Y
             --env LANGUAGE=English --env REGION=en-US --env KEYBOARD=en-US --env USERNAME=gnxlab --env PASSWORD
             --publish 127.0.0.1:8006:8006/tcp
             --volume "$storage:/storage" --volume "$RUNNER_TEMP/oem:/oem:ro" --volume "$shared:/shared"
@@ -363,7 +383,7 @@ jobs:
           {
             docker exec gnx-dockur qemu-system-x86_64 --version | head -n 1
             docker exec gnx-dockur sh -c 'pid="$(pgrep -o qemu-system)"; tr "\0" "\n" < "/proc/$pid/cmdline"' |
-              awk 'previous == "-cpu" { print "cpu=" $0 } { previous=$0 }'
+              awk 'previous == "-cpu" { print "cpu=" $0 } /^-cpu=/ { print "cpu=" substr($0, 6) } { previous=$0 }'
           } > "$RUNNER_TEMP/qemu-cpu.txt"
 
       - name: Wait for the Dockur web viewer and container health
