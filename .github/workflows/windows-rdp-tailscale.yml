@@ -24,11 +24,11 @@ on:
         type: choice
         options: ["60", "120", "180"]
       hyperv_mode:
-        description: QEMU Hyper-V enlightenments exposed to the Windows guest
+        description: QEMU Hyper-V exposure strategy for the Windows guest
         required: true
-        default: passthrough
+        default: explicit-nested
         type: choice
-        options: [passthrough, disabled]
+        options: [explicit-nested, passthrough, disabled]
 permissions:
   contents: read
 
@@ -60,7 +60,7 @@ jobs:
           [[ "$EXPECTED_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]] || { echo '::error::expected_sha256 must be 64 hexadecimal characters.'; exit 1; }
           [[ "$SLOT" =~ ^(controller|member-1|member-2)$ ]] || { echo '::error::Invalid logical slot.'; exit 1; }
           [[ "$SESSION_MINUTES" =~ ^(60|120|180)$ ]] || { echo '::error::Invalid session duration.'; exit 1; }
-          [[ "$HYPERV_MODE" =~ ^(passthrough|disabled)$ ]] || { echo '::error::Invalid Hyper-V mode.'; exit 1; }
+          [[ "$HYPERV_MODE" =~ ^(explicit-nested|passthrough|disabled)$ ]] || { echo '::error::Invalid Hyper-V mode.'; exit 1; }
           [[ -n "$TS_RDP_AUTH_KEY" ]] || { echo '::error::Missing TS_RDP_AUTH_KEY for authenticated noVNC.'; exit 1; }
 
       - name: Reclaim ephemeral runner storage
@@ -110,7 +110,10 @@ jobs:
               /sys/module/kvm_intel/parameters/enable_shadow_vmcs \
               /sys/module/kvm_intel/parameters/enable_evmcs \
               /sys/module/kvm_intel/parameters/enable_apicv \
-              /sys/module/kvm_amd/parameters/nested; do
+              /sys/module/kvm_amd/parameters/nested \
+              /sys/module/kvm_amd/parameters/npt \
+              /sys/module/kvm_amd/parameters/avic \
+              /sys/module/kvm_amd/parameters/vgif; do
               [[ -r "$parameter" ]] && printf '%s=%s\n' "$(basename "$parameter")" "$(tr -d '[:space:]' < "$parameter")"
             done
           } > "$capabilities"
@@ -328,12 +331,24 @@ jobs:
           password="$(openssl rand -hex 32)"
           export PASSWORD="$password"
           hv='Y'
-          [[ "$HYPERV_MODE" == disabled ]] && hv='N'
+          cpu_flags=''
+          case "$HYPERV_MODE" in
+            disabled)
+              hv='N'
+              ;;
+            explicit-nested)
+              hv='N'
+              # QEMU documents direct synthetic timers as required for nested
+              # Hyper-V. Keep the production-safe set explicit and exclude
+              # hv-passthrough, hv-crash, hv-reset, and Intel-only hv-evmcs.
+              cpu_flags='hv-relaxed,hv-vapic,hv-spinlocks=0xfff,hv-vpindex,hv-runtime,hv-time,hv-synic,hv-stimer,hv-stimer-direct,hv-tlbflush,hv-ipi,hv-frequencies'
+              ;;
+          esac
           docker pull "$DOCKUR_IMAGE"
           docker_args=(
             --detach --name gnx-dockur --device /dev/kvm --device /dev/net/tun --cap-add NET_ADMIN
             --env VERSION=11 --env CPU_CORES=6 --env RAM_SIZE=12G --env DISK_SIZE=100G
-            --env VMX=Y --env "HV=$hv" --env DEBUG=Y
+            --env VMX=Y --env "HV=$hv" --env "CPU_FLAGS=$cpu_flags" --env DEBUG=Y
             --env LANGUAGE=English --env REGION=en-US --env KEYBOARD=en-US --env USERNAME=gnxlab --env PASSWORD
             --publish 127.0.0.1:8006:8006/tcp
             --volume "$storage:/storage" --volume "$RUNNER_TEMP/oem:/oem:ro" --volume "$shared:/shared"
@@ -341,6 +356,15 @@ jobs:
           )
           docker run "${docker_args[@]}" "$DOCKUR_IMAGE"
           unset PASSWORD password
+          for attempt in $(seq 1 30); do
+            if docker exec gnx-dockur sh -c 'pgrep -o qemu-system >/dev/null'; then break; fi
+            sleep 2
+          done
+          {
+            docker exec gnx-dockur qemu-system-x86_64 --version | head -n 1
+            docker exec gnx-dockur sh -c 'pid="$(pgrep -o qemu-system)"; tr "\0" "\n" < "/proc/$pid/cmdline"' |
+              awk 'previous == "-cpu" { print "cpu=" $0 } { previous=$0 }'
+          } > "$RUNNER_TEMP/qemu-cpu.txt"
 
       - name: Wait for the Dockur web viewer and container health
         shell: bash
@@ -519,6 +543,7 @@ jobs:
             > "$evidence/dockur-inspect.json" || true
           df -h / > "$evidence/host-disk.txt"
           cp "$RUNNER_TEMP/kvm-capabilities.txt" "$evidence/kvm-capabilities.txt" 2>/dev/null || true
+          cp "$RUNNER_TEMP/qemu-cpu.txt" "$evidence/qemu-cpu.txt" 2>/dev/null || true
           cp "$RUNNER_TEMP/tailscale-serve.json" "$evidence/tailscale-serve.json" 2>/dev/null || true
           validator="$RUNNER_TEMP/validate-gnx-evidence.py"
           source_evidence="$RUNNER_TEMP/gnx-shared/gnx-evidence/gnx-evidence.json"
